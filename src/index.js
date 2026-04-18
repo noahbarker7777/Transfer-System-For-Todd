@@ -22,16 +22,13 @@ app.post('/call/inbound',    handleInbound);
 app.post('/call/amd-result', handleAmdResult);
 app.post('/call/status',     handleStatus);
 
-// ── Outbound call route (triggered by GHL webhook) ────────────────────────────
+// ── Outbound + TwiML routes ───────────────────────────────────────────────────
 app.use('/call', outboundRoutes);
-
-// ── TwiML helper routes ───────────────────────────────────────────────────────
 app.use('/call', twimlRoutes);
 
 // ── HTTP + WebSocket server ───────────────────────────────────────────────────
 const server = createServer(app);
 
-// Twilio media stream connects here
 const wss = new WebSocket.Server({ server, path: '/media-stream' });
 wss.on('connection', (ws, req) => {
   console.log('[ws] Twilio media stream connected');
