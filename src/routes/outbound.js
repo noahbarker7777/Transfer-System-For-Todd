@@ -2,9 +2,8 @@
 
 const express = require('express');
 const router  = express.Router();
-const { setCall } = require('../store');
+const twilio  = require('twilio');
 
-const twilio = require('twilio');
 const client = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
@@ -23,8 +22,7 @@ router.post('/outbound', async (req, res) => {
   }
 
   // Clean the number — remove spaces, dashes, parentheses
-  const cleaned = to.replace(/[\s\-\(\)]/g, '');
-  // Add +1 if not already there
+  const cleaned   = to.replace(/[\s\-\(\)]/g, '');
   const formatted = cleaned.startsWith('+') ? cleaned : `+1${cleaned}`;
 
   console.log(`[outbound] Calling client: ${formatted}`);
@@ -33,7 +31,6 @@ router.post('/outbound', async (req, res) => {
     const call = await client.calls.create({
       to:   formatted,
       from: process.env.TWILIO_PHONE_NUMBER,
-      // When client picks up, treat it exactly like an inbound call
       url:  `${process.env.SERVER_URL}/call/inbound-twiml`,
       statusCallback:       `${process.env.SERVER_URL}/call/status`,
       statusCallbackMethod: 'POST',
