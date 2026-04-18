@@ -31,7 +31,7 @@ function handleInbound(req, res) {
     '<Conference ' +
     'startConferenceOnEnter="true" ' +
     'endConferenceOnExit="false" ' +
-    'waitUrl="' + process.env.SERVER_URL + '/call/hold-twiml" ' +
+    'waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical" ' +
     'waitMethod="POST" ' +
     'beep="false">' +
     conferenceName +
