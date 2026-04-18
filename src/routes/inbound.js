@@ -59,4 +59,4 @@ router.post('/', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-module.exports = router;
+module.exports = { handleInbound };
