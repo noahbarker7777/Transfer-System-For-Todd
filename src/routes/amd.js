@@ -1,57 +1,38 @@
-/**
- * routes/amd.js
- * POST /call/amd-result
- *
- * Twilio fires this webhook after its Answering Machine Detection (AMD)
- * determines whether the agent leg was answered by a human or voicemail.
- *
- * AnsweredBy values from Twilio:
- *   "human"             → live person picked up
- *   "machine_start"     → voicemail / answering machine
- *   "machine_end_beep"  → voicemail, heard the beep
- *   "machine_end_silence" / "machine_end_other" → also voicemail
- *   "fax"               → fax machine (treat as no-answer)
- *   "unknown"           → couldn't determine
- */
+'use strict';
 
-const express  = require('express');
-const router   = express.Router();
-const store    = require('../store');
-const transfer = require('../handlers/transferHandler');
+const { getCall, updateCall } = require('../store');
+const { muteParticipant, kickParticipant, leaveVoicemail } = require('../twilioClient');
+const { signalAI } = require('../handlers/aiSignal');
 
-router.post('/', async (req, res) => {
-  // Acknowledge fast — Twilio doesn't wait for our processing
-  res.sendStatus(200);
+async function handleAmdResult(req, res) {
+  const parentCallSid = req.query.parentCallSid;
+  const answeredBy    = req.body.AnsweredBy;
 
-  const { CallSid, AnsweredBy, ParentCallSid } = req.body;
+  console.log(`[amd] Result for ${parentCallSid}: ${answeredBy}`);
 
-  // The agent call's SID is CallSid; the original client call is ParentCallSid
-  // (Twilio sets ParentCallSid on outbound calls created via the REST API)
-  const clientCallSid = ParentCallSid || CallSid;
+  const call = getCall(parentCallSid);
+  if (!call) return res.sendStatus(200);
 
-  console.log(`[AMD] Result for client=${clientCallSid}: AnsweredBy=${AnsweredBy}`);
+  if (call.state !== 'TRANSFERRING') return res.sendStatus(200);
 
-  const call = store.getCall(clientCallSid);
-  if (!call) {
-    console.warn(`[AMD] No active call found for SID ${clientCallSid}`);
-    return;
-  }
+  if (call.timer) clearTimeout(call.timer);
 
-  // Guard: only act if we're still waiting on a transfer result
-  if (call.state !== 'TRANSFERRING') {
-    console.log(`[AMD] Ignoring — call is in state ${call.state}, not TRANSFERRING`);
-    return;
-  }
-
-  const isHuman = AnsweredBy === 'human';
-
-  if (isHuman) {
-    console.log(`[AMD] Human detected → bridging agent into conference`);
-    await transfer.onAgentPickedUp(clientCallSid);
+  if (answeredBy === 'human') {
+    updateCall(parentCallSid, { state: 'CONNECTED' });
+    await muteParticipant(call.conferenceName, call.aiLegSid, false);
+    signalAI(parentCallSid, { action: 'INTRODUCE' });
+    setTimeout(async () => {
+      await kickParticipant(call.conferenceName, call.aiLegSid);
+      updateCall(parentCallSid, { state: 'DONE' });
+    }, 10000);
   } else {
-    console.log(`[AMD] Voicemail/no-answer detected → fallback`);
-    await transfer.onVoicemailDetected(clientCallSid);
+    updateCall(parentCallSid, { state: 'FALLBACK' });
+    await muteParticipant(call.conferenceName, call.aiLegSid, false);
+    signalAI(parentCallSid, { action: 'FALLBACK' });
+    leaveVoicemail(parentCallSid, call.callerNumber);
   }
-});
 
-module.exports = router;
+  res.sendStatus(200);
+}
+
+module.exports = { handleAmdResult };
