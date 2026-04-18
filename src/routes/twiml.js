@@ -1,10 +1,9 @@
 'use strict';
 
-const express = require('express');
-const router  = express.Router();
+const express    = require('express');
+const router     = express.Router();
 const { setCall } = require('../store');
 
-// ── Outbound call answered — treat exactly like an inbound call ───────────────
 router.post('/inbound-twiml', (req, res) => {
   const callSid        = req.body.CallSid;
   const callerNumber   = req.body.To;
@@ -40,7 +39,6 @@ router.post('/inbound-twiml', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ── Hold music — plays while agent leg is being dialed ────────────────────────
 router.post('/hold-twiml', (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -49,7 +47,6 @@ router.post('/hold-twiml', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ── Agent conference — agent joins the same named room as the caller ──────────
 router.post('/agent-conference-twiml', (req, res) => {
   const conferenceName = req.query.conf;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -66,7 +63,6 @@ router.post('/agent-conference-twiml', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ── Client conference ─────────────────────────────────────────────────────────
 router.post('/client-conference-twiml', (req, res) => {
   const conferenceName = req.query.conf;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -83,12 +79,10 @@ router.post('/client-conference-twiml', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ── Voicemail — fires on a silent separate leg, caller never hears this ───────
 router.post('/voicemail-twiml', (req, res) => {
   const caller      = req.query.caller  || 'a client';
   const agentName   = process.env.AGENT_NAME   || 'Todd';
   const companyName = process.env.COMPANY_NAME || 'the office';
-
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="2"/>
