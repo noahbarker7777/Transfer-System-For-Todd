@@ -4,15 +4,14 @@ const express = require('express');
 const router  = express.Router();
 
 // ── Outbound call answered — treat exactly like an inbound call ───────────────
-// When GHL triggers an outbound call and the client picks up, this fires
 router.post('/inbound-twiml', (req, res) => {
-  const callSid      = req.body.CallSid;
-  const callerNumber = req.body.To; // outbound: the client's number is the "To"
+  const callSid        = req.body.CallSid;
+  const callerNumber   = req.body.To;
   const conferenceName = `conf-${callSid}`;
 
   const { setCall } = require('../store');
   setCall(callSid, {
-    state: 'GREETING',
+    state:        'GREETING',
     conferenceName,
     callerNumber,
     aiLegSid:    callSid,
@@ -41,7 +40,7 @@ router.post('/inbound-twiml', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ── Hold music — plays to the caller while the agent leg is being dialed ──────
+// ── Hold music — plays while agent leg is being dialed ────────────────────────
 router.post('/hold-twiml', (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -67,7 +66,7 @@ router.post('/agent-conference-twiml', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ── Client conference — used if caller needs to be re-entered into the room ───
+// ── Client conference ─────────────────────────────────────────────────────────
 router.post('/client-conference-twiml', (req, res) => {
   const conferenceName = req.query.conf;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -84,8 +83,7 @@ router.post('/client-conference-twiml', (req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ── Voicemail — plays on a separate silent call leg to the agent ──────────────
-// The caller never hears this. It fires in the background during fallback.
+// ── Voicemail — fires on a silent separate leg, caller never hears this ───────
 router.post('/voicemail-twiml', (req, res) => {
   const caller      = req.query.caller  || 'a client';
   const agentName   = process.env.AGENT_NAME   || 'Todd';
