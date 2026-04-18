@@ -2,6 +2,7 @@
 
 const express = require('express');
 const router  = express.Router();
+const { setCall } = require('../store');
 
 // ── Outbound call answered — treat exactly like an inbound call ───────────────
 router.post('/inbound-twiml', (req, res) => {
@@ -9,7 +10,6 @@ router.post('/inbound-twiml', (req, res) => {
   const callerNumber   = req.body.To;
   const conferenceName = `conf-${callSid}`;
 
-  const { setCall } = require('../store');
   setCall(callSid, {
     state:        'GREETING',
     conferenceName,
