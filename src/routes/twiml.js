@@ -1,55 +1,106 @@
-/**
- * routes/twiml.js
- * Serves TwiML snippets used at various points in the call flow.
- *
- * GET  /twiml/hold-music        → plays while transfer is being attempted
- * GET  /twiml/join-conference   → agent joins the client's conference room
- * GET  /twiml/health            → simple health check endpoint
- */
+'use strict';
 
 const express = require('express');
 const router  = express.Router();
-const config  = require('../config');
 
-// ── Hold music (client hears this during transfer attempt) ───────────────────
-// Replace HOLD_MUSIC_URL with a direct MP3 link — keep it short and loop-able.
-// Free options: upload a short .mp3 to your Railway static files or use Twilio's built-in.
-const HOLD_MUSIC_URL = process.env.HOLD_MUSIC_URL ||
-  'https://com.twilio.sounds.music.us1.twilio.com/BO8e935bafc4ad3cdf6da02c67bfb45d58';
+// ── Outbound call answered — treat exactly like an inbound call ───────────────
+// When GHL triggers an outbound call and the client picks up, this fires
+router.post('/inbound-twiml', (req, res) => {
+  const callSid      = req.body.CallSid;
+  const callerNumber = req.body.To; // outbound: the client's number is the "To"
+  const conferenceName = `conf-${callSid}`;
 
-router.get('/hold-music', (req, res) => {
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play loop="10">${HOLD_MUSIC_URL}</Play>
-</Response>`;
-  res.type('text/xml').send(twiml);
-});
-
-// ── Agent joins conference ────────────────────────────────────────────────────
-// Twilio calls this URL when the agent answers the outbound dial.
-router.get('/join-conference', (req, res) => {
-  const conferenceName = req.query.conf || '';
-  if (!conferenceName) {
-    return res.type('text/xml').send('<Response><Hangup/></Response>');
-  }
+  const { setCall } = require('../store');
+  setCall(callSid, {
+    state: 'GREETING',
+    conferenceName,
+    callerNumber,
+    aiLegSid:    callSid,
+    agentLegSid: null,
+    streamSid:   null,
+    timer:       null,
+  });
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Start>
+    <Stream url="wss://${req.headers.host}/media-stream?callSid=${callSid}" />
+  </Start>
   <Dial>
     <Conference
-      startConferenceOnEnter="false"
-      endConferenceOnExit="false"
-      beep="false"
-    >${conferenceName}</Conference>
+      startConferenceOnEnter="true"
+      endConferenceOnExit="true"
+      waitUrl="${process.env.SERVER_URL}/call/hold-twiml"
+      waitMethod="POST"
+      beep="false">
+      ${conferenceName}
+    </Conference>
   </Dial>
 </Response>`;
 
   res.type('text/xml').send(twiml);
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
-router.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'ai-transfer-system', ts: new Date().toISOString() });
+// ── Hold music — plays to the caller while the agent leg is being dialed ──────
+router.post('/hold-twiml', (req, res) => {
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play loop="10">https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3</Play>
+</Response>`;
+  res.type('text/xml').send(twiml);
+});
+
+// ── Agent conference — agent joins the same named room as the caller ──────────
+router.post('/agent-conference-twiml', (req, res) => {
+  const conferenceName = req.query.conf;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      startConferenceOnEnter="false"
+      endConferenceOnExit="false"
+      beep="false">
+      ${conferenceName}
+    </Conference>
+  </Dial>
+</Response>`;
+  res.type('text/xml').send(twiml);
+});
+
+// ── Client conference — used if caller needs to be re-entered into the room ───
+router.post('/client-conference-twiml', (req, res) => {
+  const conferenceName = req.query.conf;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      startConferenceOnEnter="true"
+      endConferenceOnExit="true"
+      beep="false">
+      ${conferenceName}
+    </Conference>
+  </Dial>
+</Response>`;
+  res.type('text/xml').send(twiml);
+});
+
+// ── Voicemail — plays on a separate silent call leg to the agent ──────────────
+// The caller never hears this. It fires in the background during fallback.
+router.post('/voicemail-twiml', (req, res) => {
+  const caller      = req.query.caller  || 'a client';
+  const agentName   = process.env.AGENT_NAME   || 'Todd';
+  const companyName = process.env.COMPANY_NAME || 'the office';
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Pause length="2"/>
+  <Say voice="Polly.Joanna">
+    Hi ${agentName}, this is a message from ${companyName}.
+    You have a client calling from ${caller} who is interested in tax services.
+    Please give them a call back as soon as you can. Thank you.
+  </Say>
+</Response>`;
+  res.type('text/xml').send(twiml);
 });
 
 module.exports = router;
