@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const store = require('../store');
-const { dialAgent, muteParticipant } = require('../twilioClient');
+const { client: twilioClient } = require('../twilioClient');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -49,7 +49,8 @@ async function onClientUtterance(callSid, transcript) {
     await speakToClient(callSid, aiText);
 
     if (shouldTransfer && call.state === 'QUALIFYING') {
-      setTimeout(() => initiateTransfer(callSid), 500);
+      // Wait for the speech to finish, then transfer
+      setTimeout(() => initiateTransfer(callSid), 1500);
     }
 
   } catch (err) {
@@ -66,24 +67,17 @@ async function speakToClient(callSid, text) {
   const ws = store.getMediaConnection(callSid);
   const streamSid = call.streamSid;
 
-  if (!ws || ws.readyState !== 1 || !streamSid) {
-    console.warn('[elevenlabs] No stream ready for ' + callSid);
-    return;
-  }
+  if (!ws || ws.readyState !== 1 || !streamSid) return;
 
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
   const modelId = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
 
-  console.log('[elevenlabs] Calling API — voice: ' + voiceId + ', model: ' + modelId);
-  console.log('[elevenlabs] Text: "' + text + '"');
+  console.log('[elevenlabs] Speaking: "' + text + '"');
 
   const postData = JSON.stringify({
     text: text,
     model_id: modelId,
-    voice_settings: {
-      stability: 0.5,
-      similarity_boost: 0.75,
-    },
+    voice_settings: { stability: 0.5, similarity_boost: 0.75 },
   });
 
   const options = {
@@ -100,20 +94,17 @@ async function speakToClient(callSid, text) {
 
   return new Promise((resolve) => {
     const req = https.request(options, (apiRes) => {
-      console.log('[elevenlabs] HTTP response status: ' + apiRes.statusCode);
-
       if (apiRes.statusCode !== 200) {
         let errorBody = '';
         apiRes.on('data', (chunk) => { errorBody += chunk; });
         apiRes.on('end', () => {
-          console.error('[elevenlabs] API error body: ' + errorBody);
+          console.error('[elevenlabs] API error:', errorBody);
           resolve();
         });
         return;
       }
 
       activeAudioStreams.set(callSid, apiRes);
-
       let chunkCount = 0;
       let totalBytes = 0;
 
@@ -132,7 +123,7 @@ async function speakToClient(callSid, text) {
       });
 
       apiRes.on('end', () => {
-        console.log('[elevenlabs] Finished — ' + chunkCount + ' chunks, ' + totalBytes + ' bytes sent');
+        console.log('[elevenlabs] Finished — ' + chunkCount + ' chunks, ' + totalBytes + ' bytes');
         if (activeAudioStreams.get(callSid) === apiRes) {
           activeAudioStreams.delete(callSid);
         }
@@ -167,23 +158,30 @@ function stopCurrentAudio(callSid) {
   }
 }
 
+// NEW — Transfer redirects the client's call to a Dial TwiML that calls Todd
 async function initiateTransfer(callSid) {
   const call = store.getCall(callSid);
-  if (!call || call.state !== 'QUALIFYING') return;
+  if (!call) return;
+
+  console.log('[transfer] Redirecting client call ' + callSid + ' to agent: ' + process.env.AGENT_PHONE);
   store.updateCall(callSid, { state: 'TRANSFERRING' });
-  await muteParticipant(call.conferenceName, call.aiLegSid, true);
-  const agentCall = await dialAgent(callSid, call.conferenceName);
-  store.updateCall(callSid, { agentLegSid: agentCall.sid });
+
+  try {
+    // Update the client's call to use new TwiML that dials the agent
+    await twilioClient.calls(callSid).update({
+      url: process.env.SERVER_URL + '/call/dial-agent-twiml',
+      method: 'POST',
+    });
+    console.log('[transfer] Call successfully redirected to agent dial TwiML');
+  } catch (err) {
+    console.error('[transfer] Error:', err.message);
+  }
 }
 
-function signalAI(callSid, { action }) {
-  if (action === 'INTRODUCE') {
-    const agentName = process.env.AGENT_NAME || 'Todd';
-    speakToClient(callSid, agentName + ', I have a client on the line. I will let you connect.');
-  }
-  if (action === 'FALLBACK') {
-    onClientUtterance(callSid, 'The transfer was unsuccessful. Run your fallback script.');
-  }
+function signalAI(callSid, params) {
+  const action = params.action;
+  console.log('[ai] Signal: ' + action);
+  // These signals were from the old conference-based flow — no-ops now
 }
 
 module.exports = { onClientUtterance, speakToClient, stopCurrentAudio, signalAI, initiateTransfer };
