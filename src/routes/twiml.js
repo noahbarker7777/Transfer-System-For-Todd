@@ -3,6 +3,19 @@
 const express = require('express');
 const router = express.Router();
 
+router.post('/dial-agent-twiml', (req, res) => {
+  const agentPhone = process.env.AGENT_PHONE;
+  const twiml = '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response>' +
+    '<Say voice="Polly.Joanna">Connecting you now.</Say>' +
+    '<Dial timeout="20" answerOnBridge="true">' +
+    '<Number>' + agentPhone + '</Number>' +
+    '</Dial>' +
+    '<Say voice="Polly.Joanna">Sorry, we could not reach the agent right now. Someone will call you back shortly.</Say>' +
+    '</Response>';
+  res.type('text/xml').send(twiml);
+});
+
 router.post('/hold-twiml', (req, res) => {
   res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Play loop="10">https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3</Play></Response>');
 });
