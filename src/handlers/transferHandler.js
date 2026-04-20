@@ -103,20 +103,18 @@ async function onVoicemailDetected(clientCallSid) {
   twilio.leaveVoicemail({
     callerName:  call.callerName,
     callerPhone: call.callerPhone,
+    summary:     call.callerSummary,
   }).catch(err => console.error('[Transfer] leaveVoicemail error:', err.message));
 
-  // Redirect client back to a fresh MediaStream so the AI can resume.
-  // The pendingFallback flag tells mediaStream.js to trigger the fallback script
-  // as soon as Deepgram reconnects, without waiting for the client to speak.
+  // Play polite goodbye to client and end the call — Eryn's job is done
   try {
-    store.updateCall(clientCallSid, { pendingFallback: true });
     await twilio.client.calls(clientCallSid).update({
-      url:    config.SERVER_URL + '/call/back-to-ai?callSid=' + clientCallSid,
+      url:    config.SERVER_URL + '/call/goodbye-twiml',
       method: 'POST',
     });
-    console.log('[Transfer] Client redirected back to AI stream');
+    console.log('[Transfer] Client redirected to goodbye');
   } catch (err) {
-    console.error('[Transfer] Failed to redirect client back to AI:', err.message);
+    console.error('[Transfer] Failed to redirect client to goodbye:', err.message);
   }
 
   await logging.logOutcome(clientCallSid, 'voicemail_left');
