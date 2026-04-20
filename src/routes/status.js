@@ -42,7 +42,7 @@ router.post('/agent', async (req, res) => {
 
   if (!clientCallSid) return;
 
-  if (['busy', 'no-answer', 'failed'].includes(CallStatus)) {
+  if (['busy', 'no-answer', 'failed', 'completed'].includes(CallStatus)) {
     const call = store.getCall(clientCallSid);
     if (call && call.state === 'TRANSFERRING') {
       console.log(`[AgentStatus] Agent leg ${CallStatus} → triggering fallback`);
