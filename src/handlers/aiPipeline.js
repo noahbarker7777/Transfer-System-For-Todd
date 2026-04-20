@@ -76,17 +76,19 @@ async function onClientUtterance(callSid, transcript) {
     store.addMessage(callSid, 'assistant', aiText);
 
     // Speak the response before triggering the transfer so the client hears it
-    await speakToClient(callSid, aiText);
+    const audioBytes = await speakToClient(callSid, aiText);
 
     if (shouldTransfer) {
-      // Re-read state — speakToClient is async and state could have changed
       const current = store.getCall(callSid);
       if (current && current.state === 'QUALIFYING') {
-        // Brief pause so speech finishes, then kick off the transfer
+        // Lock state immediately so any background noise doesn't trigger a new AI turn
+        store.updateCall(callSid, { state: 'TRANSFERRING' });
+        // Wait for Twilio to finish playing buffered audio: mulaw is 8000 bytes/sec
+        const audioMs = audioBytes ? Math.ceil((audioBytes / 8000) * 1000) + 400 : 2500;
         setTimeout(() => {
           const { onTransferSignal } = require('./transferHandler'); // lazy to avoid circular dep
           onTransferSignal(callSid);
-        }, 1500);
+        }, audioMs);
       }
     }
 
@@ -189,7 +191,7 @@ async function speakToClient(callSid, text) {
         if (activeAudioStreams.get(callSid) === apiRes) {
           activeAudioStreams.delete(callSid);
         }
-        resolve();
+        resolve(totalBytes);
       });
 
       apiRes.on('error', (err) => {
