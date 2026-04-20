@@ -19,7 +19,7 @@ const config  = require('../config');
 // ── Step 1: AI fired [TRANSFER] — move client to conference, dial agent ───────
 async function onTransferSignal(clientCallSid) {
   const call = store.getCall(clientCallSid);
-  if (!call || call.state !== 'QUALIFYING') {
+  if (!call || !['QUALIFYING', 'TRANSFERRING'].includes(call.state)) {
     console.log(`[Transfer] Ignored — state is ${call?.state}`);
     return;
   }
