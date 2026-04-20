@@ -71,6 +71,10 @@ function handleMediaStream(ws, req) {
           }
         });
 
+        // Accumulate final-but-not-yet-speech_final chunks so we don't lose
+        // multi-segment utterances like "Noah Barker [pause] my number is 555..."
+        let pendingTranscript = '';
+
         dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
           const alt = data.channel?.alternatives?.[0];
           const transcript = alt?.transcript;
@@ -81,9 +85,29 @@ function handleMediaStream(ws, req) {
             ' (final=' + data.is_final + ' speech_final=' + data.speech_final + ')'
           );
 
+          if (data.is_final) {
+            pendingTranscript = pendingTranscript
+              ? pendingTranscript + ' ' + transcript
+              : transcript;
+          }
+
           if (data.speech_final) {
+            const full = pendingTranscript || transcript;
+            pendingTranscript = '';
             stopCurrentAudio(callSid);
-            onClientUtterance(callSid, transcript);
+            onClientUtterance(callSid, full);
+          }
+        });
+
+        // UtteranceEnd fires after utterance_end_ms of silence — catches cases
+        // where speech_final never fires (e.g. caller pauses after giving info)
+        dgConnection.on(LiveTranscriptionEvents.UtteranceEnd, () => {
+          if (pendingTranscript) {
+            const full = pendingTranscript;
+            pendingTranscript = '';
+            console.log('[Deepgram] UtteranceEnd → processing: "' + full + '"');
+            stopCurrentAudio(callSid);
+            onClientUtterance(callSid, full);
           }
         });
 
