@@ -55,6 +55,7 @@ async function onClientUtterance(callSid, transcript) {
     console.log('[haiku] Response: "' + aiText + '"');
 
     // Parse [TRANSFER|name=First Last|phone=1234567890] signal
+    // Also accepts bare [TRANSFER] — name/phone extracted from conversation below
     let shouldTransfer = false;
     const transferMatch = aiText.match(/\[TRANSFER(?:\|name=([^|\]]+))?(?:\|phone=([^|\]]+))?\]/);
     if (transferMatch) {
@@ -64,6 +65,12 @@ async function onClientUtterance(callSid, transcript) {
       if (callerName)  store.updateCall(callSid, { callerName });
       if (callerPhone) store.updateCall(callSid, { callerPhone });
       aiText = aiText.replace(transferMatch[0], '').trim();
+
+      // Fallback: if name or phone missing, mine them from the conversation history
+      const current = store.getCall(callSid);
+      if (!current.callerName || !current.callerPhone) {
+        extractCallerInfo(callSid, history);
+      }
     }
 
     store.addMessage(callSid, 'assistant', aiText);
@@ -85,6 +92,30 @@ async function onClientUtterance(callSid, transcript) {
 
   } catch (err) {
     console.error('[haiku] Error:', err.message);
+  }
+}
+
+// ── Extract caller name + phone from conversation when AI omits the format ────
+// Fires a lightweight Claude call on the saved history — result stored async
+async function extractCallerInfo(callSid, history) {
+  try {
+    const extraction = await anthropic.messages.create({
+      model:      'claude-haiku-4-5',
+      max_tokens: 60,
+      system:     'Extract the caller\'s first and last name and phone number from this conversation transcript. Reply ONLY with JSON like {"name":"John Smith","phone":"7145551234"}. Use null for any field not found.',
+      messages:   history,
+    });
+    const raw = extraction.content[0].text.trim();
+    const parsed = JSON.parse(raw.match(/\{.*\}/s)?.[0] || '{}');
+    const updates = {};
+    if (parsed.name  && parsed.name  !== 'null') updates.callerName  = parsed.name;
+    if (parsed.phone && parsed.phone !== 'null') updates.callerPhone = parsed.phone;
+    if (Object.keys(updates).length) {
+      store.updateCall(callSid, updates);
+      console.log('[extract] Caller info:', updates);
+    }
+  } catch (err) {
+    console.error('[extract] Failed to extract caller info:', err.message);
   }
 }
 
