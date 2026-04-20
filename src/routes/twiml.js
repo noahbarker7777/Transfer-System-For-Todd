@@ -3,11 +3,23 @@
 const express = require('express');
 const router  = express.Router();
 
+// ── Hold TwiML served by our own server — no external dependencies ────────────
+// Twilio fetches this as the conference waitUrl while the client waits for agent
+router.all('/wait-twiml', (req, res) => {
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response>' +
+      '<Say voice="Polly.Joanna">Please hold for just a moment.</Say>' +
+      '<Pause length="60"/>' +
+    '</Response>'
+  );
+});
+
 // ── Client moves into conference (hold music plays while waiting for agent) ───
 // Called via calls(sid).update() when [TRANSFER] fires
 router.all('/client-to-conference', (req, res) => {
   const conf    = req.query.conf;
-  const waitUrl = 'https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3';
+  const waitUrl = process.env.SERVER_URL + '/call/wait-twiml';
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response><Dial><Conference ' +
