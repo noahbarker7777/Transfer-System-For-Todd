@@ -40,7 +40,7 @@ router.all('/agent-join-conference', (req, res) => {
   const name       = encodeURIComponent(req.query.name  || '');
   const phone      = encodeURIComponent(req.query.phone || '');
   const serverUrl  = process.env.SERVER_URL;
-  const announceUrl = serverUrl + '/call/agent-greeting?name=' + name + '&phone=' + phone;
+  const announceUrl = serverUrl + '/call/agent-greeting?name=' + name + '&amp;phone=' + phone;
 
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
