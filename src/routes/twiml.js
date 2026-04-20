@@ -2,6 +2,7 @@
 
 const express = require('express');
 const router  = express.Router();
+const store   = require('../store');
 
 // ── Hold TwiML served by our own server — no external dependencies ────────────
 // Twilio fetches this as the conference waitUrl while the client waits for agent
@@ -37,10 +38,9 @@ router.all('/client-to-conference', (req, res) => {
 // announceUrl plays a private greeting to Todd only before he's fully bridged
 router.all('/agent-join-conference', (req, res) => {
   const conf       = req.query.conf;
-  const name       = encodeURIComponent(req.query.name  || '');
-  const phone      = encodeURIComponent(req.query.phone || '');
+  const callSid    = encodeURIComponent(req.query.callSid || '');
   const serverUrl  = process.env.SERVER_URL;
-  const announceUrl = serverUrl + '/call/agent-greeting?name=' + name + '&amp;phone=' + phone;
+  const announceUrl = serverUrl + '/call/agent-greeting?callSid=' + callSid;
 
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
@@ -57,18 +57,32 @@ router.all('/agent-join-conference', (req, res) => {
 // ── Private briefing played to agent when they join ───────────────────────────
 // Client does NOT hear this — it plays only on Todd's leg via announceUrl
 router.all('/agent-greeting', (req, res) => {
-  const name      = req.query.name  || 'a client';
-  const phone     = req.query.phone || '';
-  const agentName = process.env.AGENT_NAME    || 'Todd';
-  const phoneText = phone ? ' Their callback number is ' + phone + '.' : '';
+  const callSid   = req.query.callSid || '';
+  const agentName = process.env.AGENT_NAME || 'Todd';
+  const call      = callSid ? store.getCall(callSid) : null;
+
+  const summary = call && call.callerSummary
+    ? call.callerSummary
+    : 'I have ' + (call && call.callerName ? call.callerName : 'a client') +
+      ' on the line. They are interested in tax planning services.' +
+      (call && call.callerPhone ? ' Their number is ' + call.callerPhone + '.' : '');
 
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response><Say voice="Polly.Joanna">' +
-      'Hi ' + agentName + ', I have ' + name + ' on the line. ' +
-      'They are interested in tax planning services.' + phoneText +
-      ' Go ahead — you are connected!' +
+      'Hi ' + agentName + ', ' + summary + ' Go ahead — you are connected!' +
     '</Say></Response>'
+  );
+});
+
+// ── Polite goodbye when Todd doesn't answer — Eryn's job is done ─────────────
+router.all('/goodbye-twiml', (req, res) => {
+  const company = process.env.COMPANY_NAME || 'Frazier Industries';
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Say voice="Polly.Joanna">' +
+      'Thank you for calling ' + company + '. Todd will be in touch with you shortly. Have a great day!' +
+    '</Say><Hangup/></Response>'
   );
 });
 
