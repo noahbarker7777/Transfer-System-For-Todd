@@ -4,10 +4,10 @@ const { createServer } = require('http');
 const WebSocket = require('ws');
 
 const { handleInbound } = require('./routes/inbound');
-const { handleAmdResult } = require('./routes/amd');
-const { handleStatus } = require('./routes/status');
-const twimlRoutes = require('./routes/twiml');
+const twimlRoutes    = require('./routes/twiml');
 const outboundRoutes = require('./routes/outbound');
+const amdRoutes      = require('./routes/amd');
+const statusRoutes   = require('./routes/status');
 const { handleMediaStream } = require('./handlers/mediaStream');
 
 const app = express();
@@ -18,9 +18,11 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ── Twilio webhook routes ─────────────────────────────────────────────────────
-app.post('/call/inbound',    handleInbound);
-app.post('/call/amd-result', handleAmdResult);
-app.post('/call/status',     handleStatus);
+app.post('/call/inbound', handleInbound);
+
+// AMD and status are routers — mount with app.use so sub-routes work
+app.use('/call/amd-result', amdRoutes);
+app.use('/call/status',     statusRoutes);
 
 // ── Outbound + TwiML routes ───────────────────────────────────────────────────
 app.use('/call', outboundRoutes);
