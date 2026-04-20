@@ -2,15 +2,15 @@
 
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const { getCall, updateCall, setMediaConnection } = require('../store');
-const { onClientUtterance, stopCurrentAudio } = require('./aiPipeline');
+const { onClientUtterance, stopCurrentAudio }     = require('./aiPipeline');
 
 function handleMediaStream(ws, req) {
   console.log('[media] WebSocket connected');
 
-  let callSid = null;
-  let dgConnection = null;
+  let callSid          = null;
+  let dgConnection     = null;
   let inboundMediaCount = 0;
-  let lastLogTime = Date.now();
+  let lastLogTime      = Date.now();
 
   ws.on('message', (message) => {
     try {
@@ -21,6 +21,7 @@ function handleMediaStream(ws, req) {
       }
 
       if (msg.event === 'start') {
+        // callSid is passed as a custom stream parameter
         callSid = msg.start.customParameters && msg.start.customParameters.callSid;
 
         if (!callSid) {
@@ -35,37 +36,51 @@ function handleMediaStream(ws, req) {
         }
 
         const streamSid = msg.start.streamSid;
-        const tracks = msg.start.tracks;
+        // Update the media connection — this also handles reconnection after
+        // a voicemail fallback where a new WebSocket opens for the same callSid
         updateCall(callSid, { streamSid });
         setMediaConnection(callSid, ws);
-        console.log('[MediaStream] Started — callSid=' + callSid + ', streamSid=' + streamSid + ', tracks=' + JSON.stringify(tracks));
+        console.log('[MediaStream] Started — callSid=' + callSid + ' streamSid=' + streamSid);
 
         const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
         dgConnection = deepgram.listen.live({
-          model: process.env.DEEPGRAM_MODEL || 'nova-2',
-          language: process.env.DEEPGRAM_LANGUAGE || 'en-US',
-          encoding: 'mulaw',
-          sample_rate: 8000,
-          channels: 1,
-          smart_format: true,
+          model:           process.env.DEEPGRAM_MODEL    || 'nova-2',
+          language:        process.env.DEEPGRAM_LANGUAGE || 'en-US',
+          encoding:        'mulaw',
+          sample_rate:     8000,
+          channels:        1,
+          smart_format:    true,
           interim_results: true,
-          endpointing: parseInt(process.env.DEEPGRAM_ENDPOINTING || '300'),
+          endpointing:     parseInt(process.env.DEEPGRAM_ENDPOINTING    || '300'),
           utterance_end_ms: parseInt(process.env.DEEPGRAM_UTTERANCE_END_MS || '1000'),
         });
 
         dgConnection.on(LiveTranscriptionEvents.Open, () => {
-          console.log('[Deepgram] Session open for call ' + callSid);
+          console.log('[Deepgram] Session open for ' + callSid);
           const call = getCall(callSid);
-          if (call && call.state === 'GREETING') {
+          if (!call) return;
+
+          if (call.state === 'GREETING') {
+            // First connection — fire the opening greeting
             updateCall(callSid, { state: 'QUALIFYING' });
             onClientUtterance(callSid, '__greeting__');
+          } else if (call.pendingFallback) {
+            // Reconnection after a failed transfer — AI delivers fallback script
+            updateCall(callSid, { pendingFallback: false, state: 'FALLBACK' });
+            onClientUtterance(callSid, '__fallback__');
           }
         });
 
         dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
-          const transcript = data.channel && data.channel.alternatives && data.channel.alternatives[0] && data.channel.alternatives[0].transcript;
+          const alt = data.channel?.alternatives?.[0];
+          const transcript = alt?.transcript;
           if (!transcript || !transcript.trim()) return;
-          console.log('[Deepgram] transcript: "' + transcript + '" (final=' + data.is_final + ', speech_final=' + data.speech_final + ')');
+
+          console.log(
+            '[Deepgram] "' + transcript + '"' +
+            ' (final=' + data.is_final + ' speech_final=' + data.speech_final + ')'
+          );
+
           if (data.speech_final) {
             stopCurrentAudio(callSid);
             onClientUtterance(callSid, transcript);
@@ -84,26 +99,28 @@ function handleMediaStream(ws, req) {
       if (msg.event === 'media') {
         inboundMediaCount++;
 
-        // Log every 5 seconds to confirm audio is flowing in
+        // Periodic log to confirm audio is flowing
         const now = Date.now();
         if (now - lastLogTime > 5000) {
-          console.log('[media] Received ' + inboundMediaCount + ' audio packets from caller. Track: ' + msg.media.track);
+          console.log(
+            '[media] ' + inboundMediaCount + ' packets from caller' +
+            ' (track=' + msg.media.track + ')'
+          );
           lastLogTime = now;
         }
 
         if (dgConnection && dgConnection.getReadyState() === 1) {
-          const audioBuffer = Buffer.from(msg.media.payload, 'base64');
-          dgConnection.send(audioBuffer);
+          dgConnection.send(Buffer.from(msg.media.payload, 'base64'));
         }
       }
 
       if (msg.event === 'stop') {
-        console.log('[MediaStream] Stopped — callSid=' + callSid + ', total inbound packets: ' + inboundMediaCount);
+        console.log('[MediaStream] Stopped — callSid=' + callSid + ' total=' + inboundMediaCount);
         if (dgConnection) dgConnection.finish();
       }
 
     } catch (err) {
-      console.error('[media] Error:', err.message);
+      console.error('[media] Parse error:', err.message);
     }
   });
 
