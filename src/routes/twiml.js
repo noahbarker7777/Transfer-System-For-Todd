@@ -1,40 +1,85 @@
 'use strict';
 
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
 
-router.post('/dial-agent-twiml', (req, res) => {
-  const agentPhone = process.env.AGENT_PHONE;
-  const twiml = '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response>' +
-    '<Say voice="Polly.Joanna">Connecting you now.</Say>' +
-    '<Dial timeout="20" answerOnBridge="true">' +
-    '<Number>' + agentPhone + '</Number>' +
-    '</Dial>' +
-    '<Say voice="Polly.Joanna">Sorry, we could not reach the agent right now. Someone will call you back shortly.</Say>' +
-    '</Response>';
-  res.type('text/xml').send(twiml);
+// ── Client moves into conference (hold music plays while waiting for agent) ───
+// Called via calls(sid).update() when [TRANSFER] fires
+router.all('/client-to-conference', (req, res) => {
+  const conf    = req.query.conf;
+  const waitUrl = 'https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3';
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Dial><Conference ' +
+      'waitUrl="' + waitUrl + '" waitMethod="GET" ' +
+      'startConferenceOnEnter="false" ' +
+      'endConferenceOnExit="true" ' +
+      'beep="false">' +
+      conf +
+    '</Conference></Dial></Response>'
+  );
 });
 
-router.post('/hold-twiml', (req, res) => {
-  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Play loop="10">https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3</Play></Response>');
+// ── Agent joins conference (this URL is fetched when Todd picks up) ───────────
+// startConferenceOnEnter="true" starts the conference → client hold music stops
+// announceUrl plays a private greeting to Todd only before he's fully bridged
+router.all('/agent-join-conference', (req, res) => {
+  const conf       = req.query.conf;
+  const name       = encodeURIComponent(req.query.name  || '');
+  const phone      = encodeURIComponent(req.query.phone || '');
+  const serverUrl  = process.env.SERVER_URL;
+  const announceUrl = serverUrl + '/call/agent-greeting?name=' + name + '&phone=' + phone;
+
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Dial><Conference ' +
+      'startConferenceOnEnter="true" ' +
+      'endConferenceOnExit="false" ' +
+      'beep="false" ' +
+      'announceUrl="' + announceUrl + '" announceMethod="GET">' +
+      conf +
+    '</Conference></Dial></Response>'
+  );
 });
 
-router.post('/agent-conference-twiml', (req, res) => {
-  const conferenceName = req.query.conf;
-  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Dial><Conference startConferenceOnEnter="false" endConferenceOnExit="false" beep="false">' + conferenceName + '</Conference></Dial></Response>');
+// ── Private briefing played to agent when they join ───────────────────────────
+// Client does NOT hear this — it plays only on Todd's leg via announceUrl
+router.all('/agent-greeting', (req, res) => {
+  const name      = req.query.name  || 'a client';
+  const phone     = req.query.phone || '';
+  const agentName = process.env.AGENT_NAME    || 'Todd';
+  const phoneText = phone ? ' Their callback number is ' + phone + '.' : '';
+
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Say voice="Polly.Joanna">' +
+      'Hi ' + agentName + ', I have ' + name + ' on the line. ' +
+      'They are interested in tax planning services.' + phoneText +
+      ' Go ahead — you are connected!' +
+    '</Say></Response>'
+  );
 });
 
-router.post('/client-conference-twiml', (req, res) => {
-  const conferenceName = req.query.conf;
-  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Dial><Conference startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">' + conferenceName + '</Conference></Dial></Response>');
+// ── Return client to AI after a failed transfer (voicemail / no-answer) ───────
+// Opens a fresh MediaStream WebSocket; server resumes AI from saved history
+router.all('/back-to-ai', (req, res) => {
+  const callSid = req.query.callSid;
+  const wsUrl   = process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';
+
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Connect><Stream url="' + wsUrl + '">' +
+      '<Parameter name="callSid" value="' + callSid + '" />' +
+    '</Stream></Connect></Response>'
+  );
 });
 
-router.post('/voicemail-twiml', (req, res) => {
-  const caller = req.query.caller || 'a client';
-  const agentName = process.env.AGENT_NAME || 'Todd';
-  const companyName = process.env.COMPANY_NAME || 'the office';
-  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Pause length="2"/><Say voice="Polly.Joanna">Hi ' + agentName + ', this is a message from ' + companyName + '. You have a client calling from ' + caller + ' who is interested in tax services. Please call them back. Thank you.</Say></Response>');
+// ── Legacy hold music (kept for reference) ────────────────────────────────────
+router.all('/hold-twiml', (req, res) => {
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Play loop="10">https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3</Play></Response>'
+  );
 });
 
 module.exports = router;
