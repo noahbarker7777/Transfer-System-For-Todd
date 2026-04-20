@@ -83,6 +83,8 @@ async function onClientUtterance(callSid, transcript) {
       if (current && current.state === 'QUALIFYING') {
         // Lock state immediately so any background noise doesn't trigger a new AI turn
         store.updateCall(callSid, { state: 'TRANSFERRING' });
+        // Generate briefing summary while the audio plays out (fire-and-forget — ready before Todd picks up)
+        generateTransferSummary(callSid, history);
         // Wait for Twilio to finish playing buffered audio: mulaw is 8000 bytes/sec
         const audioMs = audioBytes ? Math.ceil((audioBytes / 8000) * 1000) + 400 : 2500;
         setTimeout(() => {
@@ -94,6 +96,23 @@ async function onClientUtterance(callSid, transcript) {
 
   } catch (err) {
     console.error('[haiku] Error:', err.message);
+  }
+}
+
+// ── Generate a spoken briefing summary for Todd (announceUrl + voicemail) ─────
+async function generateTransferSummary(callSid, history) {
+  try {
+    const result = await anthropic.messages.create({
+      model:      process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5',
+      max_tokens: 80,
+      system:     'Write 1-2 natural spoken sentences briefing a CPA named Todd about a caller. Include their name, what they need, and phone number. Sound like a colleague handoff, not a report. Example: "Noah Barker is looking for business tax help this year. His number is 714-555-1234."',
+      messages:   history,
+    });
+    const summary = result.content[0].text.trim();
+    store.updateCall(callSid, { callerSummary: summary });
+    console.log('[summary] Generated:', summary);
+  } catch (err) {
+    console.error('[summary] Failed:', err.message);
   }
 }
 
