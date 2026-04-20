@@ -1,5 +1,2 @@
 'use strict';
-
-const { signalAI } = require('./aiPipeline');
-
-module.exports = { signalAI };
+// Unused — transfer signaling is handled directly in aiPipeline.js
