@@ -13,10 +13,13 @@ function handleInbound(req, res) {
     state: 'GREETING',
     conferenceName: 'conf-' + callSid,
     callerNumber: callerNumber,
+    callerPhone: callerNumber, // default to caller ID; AI may override with confirmed number
+    callerName: null,
     aiLegSid: callSid,
-    agentLegSid: null,
+    agentCallSid: null,
     streamSid: null,
-    timer: null,
+    pendingFallback: false,
+    transferTimer: null,
   });
 
   const twiml = '<?xml version="1.0" encoding="UTF-8"?>' +
