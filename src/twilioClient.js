@@ -20,9 +20,10 @@ async function dialAgent(conferenceName, clientCallSid, callerName, callerPhone)
 
   const agentJoinUrl = config.SERVER_URL +
     '/call/agent-join-conference' +
-    '?conf='  + confParam +
-    '&name='  + nameParam +
-    '&phone=' + phoneParam;
+    '?conf='    + confParam +
+    '&name='    + nameParam +
+    '&phone='   + phoneParam +
+    '&callSid=' + encodeURIComponent(clientCallSid);
 
   const amdCallback = config.SERVER_URL +
     '/call/amd-result?clientCallSid=' + clientCallSid;
@@ -55,15 +56,16 @@ async function dialAgent(conferenceName, clientCallSid, callerName, callerPhone)
 }
 
 // ── Leave a voicemail for the agent (separate outbound call, silent to client) ─
-async function leaveVoicemail({ callerName, callerPhone }) {
+async function leaveVoicemail({ callerName, callerPhone, summary }) {
   const name    = callerName  || 'a potential client';
   const phone   = callerPhone || 'unknown';
+  const body    = summary ||
+    ('I have ' + name + ' interested in tax planning services. ' +
+     'Their phone number is ' + phone + '. ' +
+     'Please give them a call back at your earliest convenience.');
   const message =
     'Hi ' + config.AGENT_NAME + ', this is ' + config.ASSISTANT_NAME +
-    ' from ' + config.COMPANY_NAME + '. ' +
-    'I have ' + name + ' on the line — they are interested in tax planning services. ' +
-    'Their phone number is ' + phone + '. ' +
-    'Please give them a call back at your earliest convenience. Thanks!';
+    ' from ' + config.COMPANY_NAME + '. ' + body + ' Thanks!';
 
   try {
     const call = await client.calls.create({
