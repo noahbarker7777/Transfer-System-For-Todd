@@ -42,10 +42,20 @@ router.post('/agent', async (req, res) => {
 
   if (!clientCallSid) return;
 
-  if (['busy', 'no-answer', 'failed', 'completed'].includes(CallStatus)) {
+  if (['busy', 'no-answer', 'failed'].includes(CallStatus)) {
     const call = store.getCall(clientCallSid);
     if (call && call.state === 'TRANSFERRING') {
       console.log(`[AgentStatus] Agent leg ${CallStatus} → triggering fallback`);
+      await transfer.onTransferFailed(clientCallSid);
+    }
+  }
+
+  if (CallStatus === 'completed') {
+    const call = store.getCall(clientCallSid);
+    // Only fallback if AMD never confirmed a live human answer — avoids firing
+    // after a normal call end when both parties hung up after a real transfer
+    if (call && call.state === 'TRANSFERRING' && !call.agentAnsweredLive) {
+      console.log('[AgentStatus] Agent leg completed without confirmed live answer → fallback');
       await transfer.onTransferFailed(clientCallSid);
     }
   }
