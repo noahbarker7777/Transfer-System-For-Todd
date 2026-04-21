@@ -47,12 +47,21 @@ router.post('/', async (req, res) => {
     return;
   }
 
+  const DEFINITIVE_MACHINE = ['machine_end_beep', 'machine_end_silence', 'machine_end_other'];
+
   if (AnsweredBy === 'human') {
     console.log('[AMD] Human detected → bridging conference');
+    store.updateCall(clientCallSid, { agentAnsweredLive: true });
     await transfer.onAgentPickedUp(clientCallSid);
-  } else {
-    console.log(`[AMD] Non-human (${AnsweredBy}) → fallback`);
+  } else if (DEFINITIVE_MACHINE.includes(AnsweredBy)) {
+    console.log(`[AMD] Definitive machine (${AnsweredBy}) → voicemail fallback`);
     await transfer.onVoicemailDetected(clientCallSid);
+  } else if (AnsweredBy === 'fax' || AnsweredBy === 'unknown') {
+    console.log(`[AMD] ${AnsweredBy} → transfer failed fallback`);
+    await transfer.onTransferFailed(clientCallSid);
+  } else {
+    // machine_start — wait for machine_end_* before acting
+    console.log(`[AMD] machine_start detected — waiting for definitive signal`);
   }
 });
 
