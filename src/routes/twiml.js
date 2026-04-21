@@ -50,13 +50,13 @@ router.all('/agent-join-conference', (req, res) => {
   const agentName = process.env.AGENT_NAME || 'Todd';
   const call      = callSid ? store.getCall(callSid) : null;
 
-  const raw = call && call.callerSummary
-    ? call.callerSummary
-    : 'I have ' + (call && call.callerName ? call.callerName : 'a client') +
-      ' on the line. They are interested in tax planning services.' +
-      (call && call.callerPhone ? ' Their number is ' + call.callerPhone + '.' : '');
-
-  const greeting = xmlEscape('Hi ' + agentName + ', ' + raw + ' Go ahead — you are connected!');
+  const name  = (call && call.callerName)  ? call.callerName  : 'a client';
+  const phone = (call && call.callerPhone) ? call.callerPhone : null;
+  const phoneText = phone ? ' Their number is ' + phone + '.' : '';
+  const greeting = xmlEscape(
+    'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
+    phoneText + ' Go ahead — you are connected!'
+  );
 
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
