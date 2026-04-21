@@ -106,15 +106,16 @@ async function onVoicemailDetected(clientCallSid) {
     summary:     call.callerSummary,
   }).catch(err => console.error('[Transfer] leaveVoicemail error:', err.message));
 
-  // Play polite goodbye to client and end the call — Eryn's job is done
+  // Reconnect client to Eryn so she can schedule a callback with them
   try {
+    store.updateCall(clientCallSid, { pendingFallback: true });
     await twilio.client.calls(clientCallSid).update({
-      url:    config.SERVER_URL + '/call/goodbye-twiml',
+      url:    config.SERVER_URL + '/call/back-to-ai?callSid=' + clientCallSid,
       method: 'POST',
     });
-    console.log('[Transfer] Client redirected to goodbye');
+    console.log('[Transfer] Client redirected back to AI for scheduling');
   } catch (err) {
-    console.error('[Transfer] Failed to redirect client to goodbye:', err.message);
+    console.error('[Transfer] Failed to redirect client back to AI:', err.message);
   }
 
   await logging.logOutcome(clientCallSid, 'voicemail_left');
