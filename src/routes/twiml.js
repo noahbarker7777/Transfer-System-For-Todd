@@ -41,19 +41,28 @@ router.all('/client-to-conference', (req, res) => {
   );
 });
 
-// ── Agent joins conference (this URL is fetched when Todd picks up) ───────────
-// <Say> plays private briefing to Todd before he's bridged — no secondary request
-// endConferenceOnExit="true" so when Todd hangs up, conference ends cleanly
+// ── Agent answers — park silently while AMD determines human vs machine ────────
+// Server calls calls.update() on the agent leg with /agent-bridge once AMD
+// fires 'human'. This prevents greeting from playing to voicemail systems.
 router.all('/agent-join-conference', (req, res) => {
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Pause length="30"/></Response>'
+  );
+});
+
+// ── Agent confirmed human — greeting + conference bridge ───────────────────────
+// Only served via calls.update() after AMD fires 'human'
+router.all('/agent-bridge', (req, res) => {
   const conf      = req.query.conf;
   const callSid   = req.query.callSid || '';
   const agentName = process.env.AGENT_NAME || 'Todd';
   const call      = callSid ? store.getCall(callSid) : null;
 
-  const name  = (call && call.callerName)  ? call.callerName  : 'a client';
-  const phone = (call && call.callerPhone) ? call.callerPhone : null;
+  const name      = (call && call.callerName)  ? call.callerName  : 'a client';
+  const phone     = (call && call.callerPhone) ? call.callerPhone : null;
   const phoneText = phone ? ' Their number is ' + phone + '.' : '';
-  const greeting = xmlEscape(
+  const greeting  = xmlEscape(
     'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
     phoneText + ' Go ahead — you are connected!'
   );
