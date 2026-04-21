@@ -42,6 +42,24 @@ router.post('/agent', async (req, res) => {
 
   if (!clientCallSid) return;
 
+  if (CallStatus === 'answered') {
+    const call = store.getCall(clientCallSid);
+    if (call && call.state === 'TRANSFERRING') {
+      // Agent just answered — reset timeout to 30s from now so the <Say> greeting
+      // and conference-start have time to fire before we consider it a failed transfer
+      if (call.transferTimer) clearTimeout(call.transferTimer);
+      const newTimer = setTimeout(async () => {
+        const current = store.getCall(clientCallSid);
+        if (current?.state === 'TRANSFERRING' && !current?.agentAnsweredLive) {
+          console.log('[AgentStatus] Post-answer timeout — no live signal received → fallback');
+          await transfer.onTransferFailed(clientCallSid);
+        }
+      }, 30000);
+      store.updateCall(clientCallSid, { transferTimer: newTimer });
+      console.log('[AgentStatus] Agent answered — timeout extended to 30s');
+    }
+  }
+
   if (['busy', 'no-answer', 'failed'].includes(CallStatus)) {
     const call = store.getCall(clientCallSid);
     if (call && call.state === 'TRANSFERRING') {
@@ -52,8 +70,6 @@ router.post('/agent', async (req, res) => {
 
   if (CallStatus === 'completed') {
     const call = store.getCall(clientCallSid);
-    // Only fallback if AMD never confirmed a live human answer — avoids firing
-    // after a normal call end when both parties hung up after a real transfer
     if (call && call.state === 'TRANSFERRING' && !call.agentAnsweredLive) {
       console.log('[AgentStatus] Agent leg completed without confirmed live answer → fallback');
       await transfer.onTransferFailed(clientCallSid);
