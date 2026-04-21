@@ -18,37 +18,54 @@ router.all('/wait-twiml', (req, res) => {
 
 // ── Client moves into conference (hold music plays while waiting for agent) ───
 // Called via calls(sid).update() when [TRANSFER] fires
+// clientCallSid is passed so the conference statusCallback can route events back
 router.all('/client-to-conference', (req, res) => {
-  const conf    = req.query.conf;
-  const waitUrl = process.env.SERVER_URL + '/call/wait-twiml';
+  const conf             = req.query.conf;
+  const clientCallSid    = encodeURIComponent(req.query.clientCallSid || '');
+  const serverUrl        = process.env.SERVER_URL;
+  const waitUrl          = serverUrl + '/call/wait-twiml';
+  const statusCallbackUrl = serverUrl + '/call/status/conference?clientCallSid=' + clientCallSid;
+
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response><Dial><Conference ' +
       'waitUrl="' + waitUrl + '" waitMethod="GET" ' +
       'startConferenceOnEnter="false" ' +
       'endConferenceOnExit="true" ' +
-      'beep="false">' +
+      'beep="false" ' +
+      'statusCallbackUrl="' + statusCallbackUrl + '" ' +
+      'statusCallbackMethod="POST" ' +
+      'statusCallbackEvent="conference-start">' +
       conf +
     '</Conference></Dial></Response>'
   );
 });
 
 // ── Agent joins conference (this URL is fetched when Todd picks up) ───────────
-// startConferenceOnEnter="true" starts the conference → client hold music stops
-// announceUrl plays a private greeting to Todd only before he's fully bridged
+// <Say> plays private briefing to Todd before he's bridged — no secondary request
+// endConferenceOnExit="true" so when Todd hangs up, conference ends cleanly
 router.all('/agent-join-conference', (req, res) => {
-  const conf       = req.query.conf;
-  const callSid    = encodeURIComponent(req.query.callSid || '');
-  const serverUrl  = process.env.SERVER_URL;
-  const announceUrl = serverUrl + '/call/agent-greeting?callSid=' + callSid;
+  const conf      = req.query.conf;
+  const callSid   = req.query.callSid || '';
+  const agentName = process.env.AGENT_NAME || 'Todd';
+  const call      = callSid ? store.getCall(callSid) : null;
+
+  const raw = call && call.callerSummary
+    ? call.callerSummary
+    : 'I have ' + (call && call.callerName ? call.callerName : 'a client') +
+      ' on the line. They are interested in tax planning services.' +
+      (call && call.callerPhone ? ' Their number is ' + call.callerPhone + '.' : '');
+
+  const greeting = xmlEscape('Hi ' + agentName + ', ' + raw + ' Go ahead — you are connected!');
 
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Dial><Conference ' +
+    '<Response>' +
+    '<Say voice="Polly.Joanna">' + greeting + '</Say>' +
+    '<Dial><Conference ' +
       'startConferenceOnEnter="true" ' +
-      'endConferenceOnExit="false" ' +
-      'beep="false" ' +
-      'announceUrl="' + announceUrl + '" announceMethod="GET">' +
+      'endConferenceOnExit="true" ' +
+      'beep="false">' +
       conf +
     '</Conference></Dial></Response>'
   );
