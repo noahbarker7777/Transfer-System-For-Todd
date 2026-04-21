@@ -36,7 +36,8 @@ async function onTransferSignal(clientCallSid) {
   // This also closes the MediaStream WebSocket — the AI is now silent.
   try {
     await twilio.client.calls(clientCallSid).update({
-      url:    config.SERVER_URL + '/call/client-to-conference?conf=' + encodeURIComponent(conferenceName),
+      url:    config.SERVER_URL + '/call/client-to-conference?conf=' + encodeURIComponent(conferenceName) +
+              '&clientCallSid=' + encodeURIComponent(clientCallSid),
       method: 'POST',
     });
     console.log('[Transfer] Client redirected to conference — hold music playing');
@@ -59,11 +60,11 @@ async function onTransferSignal(clientCallSid) {
     return;
   }
 
-  // Safety net — if AMD never fires within the timeout, fall back gracefully
+  // Safety net — if no live answer is confirmed within timeout, fall back gracefully
   const timer = setTimeout(async () => {
     const current = store.getCall(clientCallSid);
-    if (current?.state === 'TRANSFERRING') {
-      console.log(`[Transfer] AMD timeout after ${config.TRANSFER_TIMEOUT_MS}ms → fallback`);
+    if (current?.state === 'TRANSFERRING' && !current?.agentAnsweredLive) {
+      console.log(`[Transfer] Timeout after ${config.TRANSFER_TIMEOUT_MS}ms — no live answer confirmed → fallback`);
       await onTransferFailed(clientCallSid);
     }
   }, config.TRANSFER_TIMEOUT_MS);
@@ -84,29 +85,19 @@ async function onAgentPickedUp(clientCallSid) {
   await logging.logOutcome(clientCallSid, 'transferred');
 }
 
-// ── Step 2B: Voicemail / no-answer — return client to AI silently ─────────────
+// ── Step 2B: Voicemail / no-answer — return client to AI for scheduling ───────
 async function onVoicemailDetected(clientCallSid) {
   const call = store.getCall(clientCallSid);
-  if (!call || call.state !== 'TRANSFERRING') return;
+  // Hard stop: never fire this if agent already answered live
+  if (!call || call.state !== 'TRANSFERRING' || call.agentAnsweredLive) return;
 
   if (call.transferTimer) clearTimeout(call.transferTimer);
 
   console.log(`[Transfer] Voicemail/no-answer — falling back for ${clientCallSid}`);
   store.updateCall(clientCallSid, { state: 'FALLBACK' });
 
-  // End the agent leg that hit voicemail
-  if (call.agentCallSid) {
-    await twilio.hangupCall(call.agentCallSid);
-  }
-
-  // Leave a separate voicemail silently (fire and forget — client is unaware)
-  twilio.leaveVoicemail({
-    callerName:  call.callerName,
-    callerPhone: call.callerPhone,
-    summary:     call.callerSummary,
-  }).catch(err => console.error('[Transfer] leaveVoicemail error:', err.message));
-
-  // Reconnect client to Eryn so she can schedule a callback with them
+  // Redirect client to Eryn BEFORE hanging up agent (prevents conference-end
+  // from terminating the client call before we can redirect them)
   try {
     store.updateCall(clientCallSid, { pendingFallback: true });
     await twilio.client.calls(clientCallSid).update({
@@ -118,6 +109,17 @@ async function onVoicemailDetected(clientCallSid) {
     console.error('[Transfer] Failed to redirect client back to AI:', err.message);
   }
 
+  // End the agent leg (conference ends after client already left)
+  if (call.agentCallSid) {
+    await twilio.hangupCall(call.agentCallSid);
+  }
+
+  // Leave a simple voicemail: name + number only
+  twilio.leaveVoicemail({
+    callerName:  call.callerName,
+    callerPhone: call.callerPhone,
+  }).catch(err => console.error('[Transfer] leaveVoicemail error:', err.message));
+
   await logging.logOutcome(clientCallSid, 'voicemail_left');
 }
 
@@ -125,7 +127,11 @@ async function onVoicemailDetected(clientCallSid) {
 async function onTransferFailed(clientCallSid) {
   const call = store.getCall(clientCallSid);
   if (!call) return;
-  // Ensure the guard in onVoicemailDetected passes
+  // Never trigger fallback if a live answer was already confirmed
+  if (call.agentAnsweredLive) {
+    console.log('[Transfer] onTransferFailed blocked — agent already answered live');
+    return;
+  }
   store.updateCall(clientCallSid, { state: 'TRANSFERRING' });
   await onVoicemailDetected(clientCallSid);
 }
