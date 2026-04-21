@@ -71,19 +71,13 @@ router.post('/agent', async (req, res) => {
   }
 });
 
-// ── Conference events ─────────────────────────────────────────────────────────
-// conference-start fires when the first startConferenceOnEnter="true" participant
-// joins — that's always the agent. Voicemail systems cannot join Twilio conferences,
-// so this event is a 100% reliable "live human answered" signal.
+// ── Conference events (debug logging only) ───────────────────────────────────
 router.post('/conference', async (req, res) => {
   res.sendStatus(200);
   const { FriendlyName, StatusCallbackEvent, CallSid } = req.body;
   const clientCallSid = req.query.clientCallSid;
 
   console.log(`[Conference] ${FriendlyName} → ${StatusCallbackEvent} (${CallSid}) client=${clientCallSid}`);
-
-  // conference-start fires for both live humans AND voicemail systems (both can join
-  // a Twilio conference), so it is NOT a reliable live-answer signal — AMD is used instead
 });
 
 // ── Recording callback ────────────────────────────────────────────────────────
