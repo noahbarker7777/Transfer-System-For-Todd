@@ -56,16 +56,12 @@ async function dialAgent(conferenceName, clientCallSid, callerName, callerPhone)
 }
 
 // ── Leave a voicemail for the agent (separate outbound call, silent to client) ─
-async function leaveVoicemail({ callerName, callerPhone, summary }) {
+async function leaveVoicemail({ callerName, callerPhone }) {
   const name    = callerName  || 'a potential client';
   const phone   = callerPhone || 'unknown';
-  const body    = summary ||
-    ('I have ' + name + ' interested in tax planning services. ' +
-     'Their phone number is ' + phone + '. ' +
-     'Please give them a call back at your earliest convenience.');
   const message =
-    'Hi ' + config.AGENT_NAME + ', this is ' + config.ASSISTANT_NAME +
-    ' from ' + config.COMPANY_NAME + '. ' + body + ' Thanks!';
+    'Hi ' + config.AGENT_NAME + ', ' + name + ' called about tax services. ' +
+    'Their number is ' + phone + '. Please give them a call back.';
 
   try {
     const call = await client.calls.create({
