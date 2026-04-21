@@ -61,11 +61,25 @@ router.post('/agent', async (req, res) => {
   }
 });
 
-// ── Conference events (debug logging only) ────────────────────────────────────
-router.post('/conference', (req, res) => {
+// ── Conference events ─────────────────────────────────────────────────────────
+// conference-start fires when the first startConferenceOnEnter="true" participant
+// joins — that's always the agent. Voicemail systems cannot join Twilio conferences,
+// so this event is a 100% reliable "live human answered" signal.
+router.post('/conference', async (req, res) => {
   res.sendStatus(200);
   const { FriendlyName, StatusCallbackEvent, CallSid } = req.body;
-  console.log(`[Conference] ${FriendlyName} → ${StatusCallbackEvent} (${CallSid})`);
+  const clientCallSid = req.query.clientCallSid;
+
+  console.log(`[Conference] ${FriendlyName} → ${StatusCallbackEvent} (${CallSid}) client=${clientCallSid}`);
+
+  if (StatusCallbackEvent === 'conference-start' && clientCallSid) {
+    const call = store.getCall(clientCallSid);
+    if (call && call.state === 'TRANSFERRING' && !call.agentAnsweredLive) {
+      console.log('[Conference] conference-start → agent is live — locking out all fallback triggers');
+      store.updateCall(clientCallSid, { agentAnsweredLive: true });
+      await transfer.onAgentPickedUp(clientCallSid);
+    }
+  }
 });
 
 // ── Recording callback ────────────────────────────────────────────────────────
