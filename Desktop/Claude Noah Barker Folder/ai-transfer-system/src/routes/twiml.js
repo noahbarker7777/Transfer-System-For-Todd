@@ -54,28 +54,43 @@ router.all('/agent-whisper', (req, res) => {
 });
 
 // ── Dial result: fires once <Dial> completes for any reason ───────────────────
-// DialCallStatus values:
-//   completed  → call bridged successfully and ended naturally → hang up client
-//   answered   → bridged (older Twilio versions) → hang up client
-//   no-answer  → Todd didn't pick up → leave voicemail, return client to AI
-//   busy       → Todd's line busy → voicemail + return to AI
-//   failed     → carrier failure → voicemail + return to AI
-//   canceled   → we canceled before answer → just hang up
+// SOURCE OF TRUTH: DialCallDuration. If > 0, Todd answered and the bridge
+// happened — the call is over. Hang up. Never leave a voicemail in this case.
+// Only treat the dial as "failed" if duration is 0 AND DialCallStatus is one
+// of the definitive failure states. Anything ambiguous → hangup, never recall.
 router.post('/dial-result', async (req, res) => {
   const clientCallSid = req.query.clientCallSid;
   const status        = req.body.DialCallStatus;
+  const duration      = parseInt(req.body.DialCallDuration || '0', 10);
+  const dialedSid     = req.body.DialCallSid;
   const call          = store.getCall(clientCallSid);
 
-  console.log('[DialResult] client=' + clientCallSid + ' DialCallStatus=' + status);
+  console.log('[DialResult] client=' + clientCallSid +
+              ' status=' + status +
+              ' duration=' + duration +
+              ' dialedSid=' + dialedSid +
+              ' fullBody=' + JSON.stringify(req.body));
 
-  if (status === 'completed' || status === 'answered') {
+  // Bridge happened (Todd answered) — we are DONE. No voicemail, no callback.
+  if (duration > 0) {
     if (call) store.updateCall(clientCallSid, { state: 'DONE' });
+    console.log('[DialResult] Bridge completed (duration>0) → hanging up client');
     return res.type('text/xml').send(
       '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
     );
   }
 
-  // Transfer didn't bridge — leave Todd a voicemail and send client back to AI.
+  // Duration is 0 — Todd never answered. Only fallback for definitive failures.
+  const FAILURE_STATES = ['no-answer', 'busy', 'failed'];
+  if (!FAILURE_STATES.includes(status)) {
+    console.log('[DialResult] No bridge but status not a definitive failure → hanging up');
+    return res.type('text/xml').send(
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    );
+  }
+
+  // Definitive no-answer/busy/failed AND duration=0 → leave voicemail + AI.
+  console.log('[DialResult] Definitive failure → voicemail + back to AI');
   if (call && !call.voicemailLeft) {
     store.updateCall(clientCallSid, {
       state: 'FALLBACK',

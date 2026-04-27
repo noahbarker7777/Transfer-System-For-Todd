@@ -2,19 +2,17 @@
 
 /**
  * routes/status.js
- * Mounted at /call/status — handles all Twilio call lifecycle events.
+ * Mounted at /call/status.
  *
- * POST /call/status/          → generic call status (client call ended)
- * POST /call/status/agent     → agent leg status (busy / no-answer / failed)
- * POST /call/status/conference → conference participant events (debug logging)
- * POST /call/status/recording  → recording callback
+ * The new warm-transfer architecture uses a single <Dial> with action URL,
+ * so there is no separate agent leg, no AMD, no conference. Callbacks here
+ * exist only to log and clean up the client call when it ends.
  */
 
-const express  = require('express');
-const router   = express.Router();
-const store    = require('../store');
-const logging  = require('../handlers/logging');
-const transfer = require('../handlers/transferHandler');
+const express = require('express');
+const router  = express.Router();
+const store   = require('../store');
+const logging = require('../handlers/logging');
 
 // ── Generic call status (root client call) ────────────────────────────────────
 router.post('/', async (req, res) => {
@@ -31,53 +29,16 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ── Agent leg status ──────────────────────────────────────────────────────────
-// clientCallSid is passed as ?clientCallSid= when we create the agent call
-router.post('/agent', async (req, res) => {
+// ── Legacy agent-leg status (no-op, logs only) ────────────────────────────────
+router.post('/agent', (req, res) => {
   res.sendStatus(200);
-  const { CallSid, CallStatus } = req.body;
-  const clientCallSid = req.query.clientCallSid || req.body.ParentCallSid;
-
-  console.log(`[AgentStatus] Agent ${CallSid} → ${CallStatus}  client=${clientCallSid}`);
-
-  if (!clientCallSid) return;
-
-  if (CallStatus === 'in-progress') {
-    const call = store.getCall(clientCallSid);
-    if (call && call.state === 'TRANSFERRING') {
-      if (call.transferTimer) clearTimeout(call.transferTimer);
-      // Bridge immediately on answer — AMD is unreliable for silent live callers.
-      // agentAnsweredLive guards prevent any later timer or status from firing fallback.
-      store.updateCall(clientCallSid, { agentAnsweredLive: true });
-      console.log('[AgentStatus] Agent answered — bridging immediately');
-      await transfer.onAgentPickedUp(clientCallSid);
-    }
-  }
-
-  if (['busy', 'no-answer', 'failed'].includes(CallStatus)) {
-    const call = store.getCall(clientCallSid);
-    if (call && call.state === 'TRANSFERRING') {
-      console.log(`[AgentStatus] Agent leg ${CallStatus} → triggering fallback`);
-      await transfer.onTransferFailed(clientCallSid);
-    }
-  }
-
-  if (CallStatus === 'completed') {
-    const call = store.getCall(clientCallSid);
-    if (call && call.state === 'TRANSFERRING' && !call.agentAnsweredLive) {
-      console.log('[AgentStatus] Agent leg completed without confirmed live answer → fallback');
-      await transfer.onTransferFailed(clientCallSid);
-    }
-  }
+  console.log('[AgentStatus-Legacy] Ignored:', JSON.stringify(req.body));
 });
 
-// ── Conference events (debug logging only) ───────────────────────────────────
-router.post('/conference', async (req, res) => {
+// ── Legacy conference events (no-op, logs only) ───────────────────────────────
+router.post('/conference', (req, res) => {
   res.sendStatus(200);
-  const { FriendlyName, StatusCallbackEvent, CallSid } = req.body;
-  const clientCallSid = req.query.clientCallSid;
-
-  console.log(`[Conference] ${FriendlyName} → ${StatusCallbackEvent} (${CallSid}) client=${clientCallSid}`);
+  console.log('[Conference-Legacy] Ignored:', JSON.stringify(req.body));
 });
 
 // ── Recording callback ────────────────────────────────────────────────────────

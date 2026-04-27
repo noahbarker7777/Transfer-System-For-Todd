@@ -24,12 +24,13 @@ const config = require('../config');
 
 async function onTransferSignal(clientCallSid) {
   const call = store.getCall(clientCallSid);
-  if (!call || !['QUALIFYING', 'TRANSFERRING'].includes(call.state)) {
-    console.log(`[Transfer] Ignored — state is ${call?.state}`);
+  if (!call || call.state !== 'QUALIFYING') {
+    console.log(`[Transfer] Ignored — state is ${call?.state} (not QUALIFYING)`);
     return;
   }
 
   console.log(`[Transfer] Redirecting client ${clientCallSid} to bridge TwiML`);
+  // Lock state immediately so a duplicate [TRANSFER] from the AI cannot re-enter.
   store.updateCall(clientCallSid, { state: 'TRANSFERRING' });
 
   try {
