@@ -2,151 +2,62 @@
 
 /**
  * handlers/transferHandler.js
- * Core transfer state machine.
  *
- * States:
- *   QUALIFYING   → TRANSFERRING   onTransferSignal()
- *   TRANSFERRING → DONE           onAgentPickedUp()    (conference live, agent answered)
- *   TRANSFERRING → FALLBACK       onVoicemailDetected() / onTransferFailed()
- *   FALLBACK     → (AI resumes conversation after stream reconnects)
+ * Final architecture — version "SMS-FIRST" (build tag: TRANSFER_V3).
+ *
+ * The whisper-URL approach was failing at bridge time: Twilio fetches the
+ * <Number url="..."> TwiML when the called party answers, and any latency or
+ * error on that fetch leaves both lines silent because the bridge never
+ * completes. Switching to SMS removes that fetch from the critical path.
+ *
+ * Flow:
+ *   1. Send Todd an SMS with caller name + phone + topic (instant, silent).
+ *   2. Redirect the client call to a bare <Dial> — no whisper, no action URL
+ *      side effects, just a plain bridge to Todd's number.
+ *   3. When the dial completes for any reason, /dial-result decides: bridge
+ *      duration > 0 → hangup cleanly; otherwise → send client back to AI for
+ *      callback scheduling. We NEVER place a second outbound call to Todd.
  */
 
-const store   = require('../store');
-const twilio  = require('../twilioClient');
-const logging = require('./logging');
-const config  = require('../config');
+const store  = require('../store');
+const twilio = require('../twilioClient');
+const config = require('../config');
 
-// ── Step 1: AI fired [TRANSFER] — move client to conference, dial agent ───────
+const BUILD_TAG = 'TRANSFER_V3';
+
 async function onTransferSignal(clientCallSid) {
   const call = store.getCall(clientCallSid);
-  if (!call || !['QUALIFYING', 'TRANSFERRING'].includes(call.state)) {
-    console.log(`[Transfer] Ignored — state is ${call?.state}`);
+  if (!call || call.state !== 'QUALIFYING') {
+    console.log(`[Transfer ${BUILD_TAG}] Ignored — state=${call?.state} (need QUALIFYING)`);
     return;
   }
 
-  console.log(`[Transfer] Transfer signal received for ${clientCallSid}`);
+  console.log(`[Transfer ${BUILD_TAG}] Beginning transfer for ${clientCallSid}`);
   store.updateCall(clientCallSid, { state: 'TRANSFERRING' });
 
-  const conferenceName = call.conferenceName;
-  const callerName     = call.callerName  || '';
-  const callerPhone    = call.callerPhone || '';
-
-  // Move the client into a Twilio conference room.
-  // They will hear hold music (waitUrl) until the agent joins.
-  // This also closes the MediaStream WebSocket — the AI is now silent.
-  try {
-    await twilio.client.calls(clientCallSid).update({
-      url:    config.SERVER_URL + '/call/client-to-conference?conf=' + encodeURIComponent(conferenceName) +
-              '&clientCallSid=' + encodeURIComponent(clientCallSid),
-      method: 'POST',
-    });
-    console.log('[Transfer] Client redirected to conference — hold music playing');
-  } catch (err) {
-    console.error('[Transfer] Failed to redirect client to conference:', err.message);
-    await onTransferFailed(clientCallSid);
-    return;
-  }
-
-  // Dial the agent into the same conference with AMD.
-  // The agent hears a private briefing (announceUrl) when they join.
-  try {
-    const agentCallSid = await twilio.dialAgent(
-      conferenceName, clientCallSid, callerName, callerPhone
-    );
-    store.updateCall(clientCallSid, { agentCallSid });
-  } catch (err) {
-    console.error('[Transfer] Failed to dial agent:', err.message);
-    await onTransferFailed(clientCallSid);
-    return;
-  }
-
-  // Safety net — if no live answer is confirmed within timeout, fall back gracefully
-  const timer = setTimeout(async () => {
-    const current = store.getCall(clientCallSid);
-    if (current?.state === 'TRANSFERRING' && !current?.agentAnsweredLive) {
-      console.log(`[Transfer] Timeout after ${config.TRANSFER_TIMEOUT_MS}ms — no live answer confirmed → fallback`);
-      await onTransferFailed(clientCallSid);
-    }
-  }, config.TRANSFER_TIMEOUT_MS);
-
-  store.updateCall(clientCallSid, { transferTimer: timer });
-}
-
-// ── Step 2A: AMD confirmed human — play greeting then bridge into conference ────
-async function onAgentPickedUp(clientCallSid) {
-  const call = store.getCall(clientCallSid);
-  if (!call || call.state !== 'TRANSFERRING') return;
-
-  if (call.transferTimer) clearTimeout(call.transferTimer);
-
-  console.log(`[Transfer] Agent confirmed human — redirecting to greeting + bridge`);
-  store.updateCall(clientCallSid, { state: 'DONE' });
-
-  // Interrupt the silent <Pause> on the agent leg and serve the greeting + conference TwiML
-  const bridgeUrl = config.SERVER_URL + '/call/agent-bridge' +
-    '?conf='    + encodeURIComponent(call.conferenceName) +
-    '&callSid=' + encodeURIComponent(clientCallSid);
-
-  try {
-    await twilio.client.calls(call.agentCallSid).update({ url: bridgeUrl, method: 'GET' });
-    console.log('[Transfer] Agent redirected to greeting + conference bridge');
-  } catch (err) {
-    console.error('[Transfer] Failed to redirect agent to bridge:', err.message);
-  }
-
-  await logging.logOutcome(clientCallSid, 'transferred');
-}
-
-// ── Step 2B: Voicemail / no-answer — return client to AI for scheduling ───────
-async function onVoicemailDetected(clientCallSid) {
-  const call = store.getCall(clientCallSid);
-  // Hard stop: never fire this if agent already answered live
-  if (!call || call.state !== 'TRANSFERRING' || call.agentAnsweredLive) return;
-
-  if (call.transferTimer) clearTimeout(call.transferTimer);
-
-  console.log(`[Transfer] Voicemail/no-answer — falling back for ${clientCallSid}`);
-  store.updateCall(clientCallSid, { state: 'FALLBACK' });
-
-  // Redirect client to Eryn BEFORE hanging up agent (prevents conference-end
-  // from terminating the client call before we can redirect them)
-  try {
-    store.updateCall(clientCallSid, { pendingFallback: true });
-    await twilio.client.calls(clientCallSid).update({
-      url:    config.SERVER_URL + '/call/back-to-ai?callSid=' + clientCallSid,
-      method: 'POST',
-    });
-    console.log('[Transfer] Client redirected back to AI for scheduling');
-  } catch (err) {
-    console.error('[Transfer] Failed to redirect client back to AI:', err.message);
-  }
-
-  // End the agent leg (conference ends after client already left)
-  if (call.agentCallSid) {
-    await twilio.hangupCall(call.agentCallSid);
-  }
-
-  // Leave a simple voicemail: name + number only
-  twilio.leaveVoicemail({
+  // 1. SMS Todd the briefing (fire-and-forget; do not block the bridge on this).
+  twilio.smsBriefing({
     callerName:  call.callerName,
     callerPhone: call.callerPhone,
-  }).catch(err => console.error('[Transfer] leaveVoicemail error:', err.message));
+    context:     'pre-transfer',
+  }).catch(err => console.error(`[Transfer ${BUILD_TAG}] SMS error:`, err.message));
 
-  await logging.logOutcome(clientCallSid, 'voicemail_left');
-}
-
-// ── Step 2C: Agent leg failed entirely (busy / failed / error) ───────────────
-async function onTransferFailed(clientCallSid) {
-  const call = store.getCall(clientCallSid);
-  if (!call) return;
-  // Never trigger fallback if a live answer was already confirmed
-  if (call.agentAnsweredLive) {
-    console.log('[Transfer] onTransferFailed blocked — agent already answered live');
-    return;
+  // 2. Redirect the client call to the bare bridge TwiML.
+  try {
+    await twilio.client.calls(clientCallSid).update({
+      url:    config.SERVER_URL + '/call/transfer-bridge?callSid=' + encodeURIComponent(clientCallSid),
+      method: 'POST',
+    });
+    console.log(`[Transfer ${BUILD_TAG}] Client redirected to /call/transfer-bridge`);
+  } catch (err) {
+    console.error(`[Transfer ${BUILD_TAG}] Redirect failed:`, err.message);
   }
-  store.updateCall(clientCallSid, { state: 'TRANSFERRING' });
-  await onVoicemailDetected(clientCallSid);
 }
+
+// Legacy no-ops — old in-flight calls' callbacks may still hit these handlers.
+async function onAgentPickedUp() {}
+async function onVoicemailDetected() {}
+async function onTransferFailed() {}
 
 module.exports = {
   onTransferSignal,

@@ -3,6 +3,100 @@
 const express = require('express');
 const router  = express.Router();
 const store   = require('../store');
+const twilio  = require('../twilioClient');
+
+const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// ── Warm transfer: bare bridge (build tag TRANSFER_V3) ────────────────────────
+// No <Number url="whisper"> — that fetch was the bridge-failure point. The
+// briefing was already sent to Todd via SMS in transferHandler before this
+// runs, so when he answers his phone, both lines bridge instantly with no
+// dependency on a webhook fetch completing in time.
+router.all('/transfer-bridge', (req, res) => {
+  const callSid   = req.query.callSid;
+  const serverUrl = process.env.SERVER_URL;
+  const todd      = process.env.AGENT_PHONE;
+  const callerId  = process.env.TWILIO_PHONE_NUMBER;
+  const actionUrl = serverUrl + '/call/dial-result?clientCallSid=' + encodeURIComponent(callSid);
+
+  console.log('[transfer-bridge V3] callSid=' + callSid + ' todd=' + todd);
+
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response>' +
+      '<Dial answerOnBridge="true" timeout="20" callerId="' + callerId + '" ' +
+            'action="' + actionUrl + '" method="POST">' +
+        todd +
+      '</Dial>' +
+    '</Response>'
+  );
+});
+
+// ── Legacy whisper endpoint (kept as harmless silence in case Twilio hits it) ─
+router.all('/agent-whisper', (req, res) => {
+  console.log('[agent-whisper LEGACY] hit — returning empty response');
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+  );
+});
+
+// ── Dial result: fires once <Dial> completes for any reason ───────────────────
+// HARD GUARANTEE: this route NEVER places an outbound call to Todd. The only
+// outcomes are (a) hang up the client, or (b) reconnect client to AI for
+// scheduling. The Todd briefing was already SMSed before the dial; if he
+// missed the live call, the SMS already told him who called and why.
+router.post('/dial-result', async (req, res) => {
+  const clientCallSid = req.query.clientCallSid;
+  const status        = req.body.DialCallStatus;
+  const duration      = parseInt(req.body.DialCallDuration || '0', 10);
+  const dialedSid     = req.body.DialCallSid;
+  const call          = store.getCall(clientCallSid);
+
+  console.log('[DialResult V3] client=' + clientCallSid +
+              ' status=' + status +
+              ' duration=' + duration +
+              ' dialedSid=' + dialedSid +
+              ' state=' + call?.state +
+              ' fullBody=' + JSON.stringify(req.body));
+
+  // Bridge happened (any duration > 0) — we are DONE. End the client call.
+  if (duration > 0) {
+    if (call) store.updateCall(clientCallSid, { state: 'DONE' });
+    console.log('[DialResult V3] Bridge completed → hanging up client');
+    return res.type('text/xml').send(
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    );
+  }
+
+  // Duration 0 — Todd never bridged. Only treat as "Todd unavailable" for
+  // definitive failure states. Anything else (canceled, completed-with-0,
+  // unknown) → hang up to be safe; we will NEVER recall Todd from here.
+  const FAILURE_STATES = ['no-answer', 'busy', 'failed'];
+  if (!FAILURE_STATES.includes(status)) {
+    console.log('[DialResult V3] Not a definitive failure → hangup');
+    return res.type('text/xml').send(
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    );
+  }
+
+  // Todd unavailable. Send client back to AI for callback scheduling.
+  // No outbound call to Todd — the SMS we already sent is sufficient.
+  console.log('[DialResult V3] Todd unavailable (' + status + ') → back to AI');
+  if (call) {
+    store.updateCall(clientCallSid, {
+      state: 'FALLBACK',
+      pendingFallback: true,
+    });
+  }
+
+  const wsUrl = process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Connect><Stream url="' + wsUrl + '">' +
+      '<Parameter name="callSid" value="' + clientCallSid + '" />' +
+    '</Stream></Connect></Response>'
+  );
+});
 
 // ── Hold TwiML served by our own server — no external dependencies ────────────
 // Twilio fetches this as the conference waitUrl while the client waits for agent
@@ -41,18 +135,38 @@ router.all('/client-to-conference', (req, res) => {
   );
 });
 
-// ── Agent answers — park silently while AMD determines human vs machine ────────
-// Server calls calls.update() on the agent leg with /agent-bridge once AMD
-// fires 'human'. This prevents greeting from playing to voicemail systems.
+// ── Agent answers — play briefing immediately then join conference ────────────
+// Greeting plays privately to Todd; client hears hold music until Todd joins.
+// No AMD gate needed — greeting fires the moment Todd picks up.
 router.all('/agent-join-conference', (req, res) => {
+  const conf      = req.query.conf;
+  const callSid   = req.query.callSid || '';
+  const agentName = process.env.AGENT_NAME || 'Todd';
+  const call      = callSid ? store.getCall(callSid) : null;
+
+  const name      = (call && call.callerName)  ? call.callerName  : 'a client';
+  const phone     = (call && call.callerPhone) ? call.callerPhone : null;
+  const phoneText = phone ? ' Their number is ' + phone + '.' : '';
+  const greeting  = xmlEscape(
+    'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
+    phoneText + ' Go ahead — you are connected!'
+  );
+
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Pause length="30"/></Response>'
+    '<Response>' +
+    '<Say voice="Polly.Joanna">' + greeting + '</Say>' +
+    '<Dial><Conference ' +
+      'startConferenceOnEnter="true" ' +
+      'endConferenceOnExit="true" ' +
+      'beep="false">' +
+      conf +
+    '</Conference></Dial></Response>'
   );
 });
 
-// ── Agent confirmed human — greeting + conference bridge ───────────────────────
-// Only served via calls.update() after AMD fires 'human'
+// ── Agent greeting + conference bridge ────────────────────────────────────────
+// Served via calls.update() once answered status fires
 router.all('/agent-bridge', (req, res) => {
   const conf      = req.query.conf;
   const callSid   = req.query.callSid || '';
@@ -81,9 +195,6 @@ router.all('/agent-bridge', (req, res) => {
 });
 
 // ── Private briefing played to agent when they join ───────────────────────────
-// Client does NOT hear this — it plays only on Todd's leg via announceUrl
-const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
 router.all('/agent-greeting', (req, res) => {
   const callSid   = req.query.callSid || '';
   const agentName = process.env.AGENT_NAME || 'Todd';
