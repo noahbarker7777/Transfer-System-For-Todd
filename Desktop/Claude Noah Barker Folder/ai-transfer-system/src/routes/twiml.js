@@ -7,57 +7,44 @@ const twilio  = require('../twilioClient');
 
 const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// ── Warm transfer: redirect client here, Twilio dials Todd with whisper ───────
-// Single TwiML eliminates conference + AMD + status callback race conditions.
-// answerOnBridge gives the client ringback while Todd's phone rings.
-// <Number url=""> plays the whisper privately to Todd before bridging.
-// action fires after dial completes with DialCallStatus → /dial-result decides
-// success vs voicemail/no-answer fallback.
+// ── Warm transfer: bare bridge (build tag TRANSFER_V3) ────────────────────────
+// No <Number url="whisper"> — that fetch was the bridge-failure point. The
+// briefing was already sent to Todd via SMS in transferHandler before this
+// runs, so when he answers his phone, both lines bridge instantly with no
+// dependency on a webhook fetch completing in time.
 router.all('/transfer-bridge', (req, res) => {
-  const callSid    = req.query.callSid;
-  const serverUrl  = process.env.SERVER_URL;
-  const todd       = process.env.AGENT_PHONE;
-  const callerId   = process.env.TWILIO_PHONE_NUMBER;
-  const whisperUrl = serverUrl + '/call/agent-whisper?callSid=' + encodeURIComponent(callSid);
-  const actionUrl  = serverUrl + '/call/dial-result?clientCallSid=' + encodeURIComponent(callSid);
+  const callSid   = req.query.callSid;
+  const serverUrl = process.env.SERVER_URL;
+  const todd      = process.env.AGENT_PHONE;
+  const callerId  = process.env.TWILIO_PHONE_NUMBER;
+  const actionUrl = serverUrl + '/call/dial-result?clientCallSid=' + encodeURIComponent(callSid);
+
+  console.log('[transfer-bridge V3] callSid=' + callSid + ' todd=' + todd);
 
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
       '<Dial answerOnBridge="true" timeout="20" callerId="' + callerId + '" ' +
             'action="' + actionUrl + '" method="POST">' +
-        '<Number url="' + whisperUrl + '" method="GET">' + todd + '</Number>' +
+        todd +
       '</Dial>' +
     '</Response>'
   );
 });
 
-// ── Whisper played privately to Todd before bridging ──────────────────────────
-// Twilio fetches this when Todd picks up. After <Say> completes, Twilio
-// auto-bridges Todd with the client. AI is gone — no MediaStream, no agent.
+// ── Legacy whisper endpoint (kept as harmless silence in case Twilio hits it) ─
 router.all('/agent-whisper', (req, res) => {
-  const callSid   = req.query.callSid || '';
-  const call      = callSid ? store.getCall(callSid) : null;
-  const agentName = process.env.AGENT_NAME || 'Todd';
-  const name      = (call && call.callerName)  ? call.callerName  : 'a client';
-  const phone     = (call && call.callerPhone) ? call.callerPhone : null;
-  const phoneText = phone ? ' Their number is ' + phone + '.' : '';
-  const greeting  = xmlEscape(
-    'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
-    phoneText + ' Go ahead — you are connected!'
-  );
-
+  console.log('[agent-whisper LEGACY] hit — returning empty response');
   res.type('text/xml').send(
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Say voice="Polly.Joanna">' + greeting + '</Say></Response>'
+    '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
   );
 });
 
 // ── Dial result: fires once <Dial> completes for any reason ───────────────────
-// SOURCE OF TRUTH: DialCallDuration. If > 0, Todd answered and the bridge
-// happened — the call is over. Hang up. Never leave a voicemail in this case.
-// Only treat the dial as "failed" if duration is 0 AND DialCallStatus is one
-// of the definitive failure states. Anything ambiguous → hangup, never recall.
+// HARD GUARANTEE: this route NEVER places an outbound call to Todd. The only
+// outcomes are (a) hang up the client, or (b) reconnect client to AI for
+// scheduling. The Todd briefing was already SMSed before the dial; if he
+// missed the live call, the SMS already told him who called and why.
 router.post('/dial-result', async (req, res) => {
   const clientCallSid = req.query.clientCallSid;
   const status        = req.body.DialCallStatus;
@@ -65,42 +52,41 @@ router.post('/dial-result', async (req, res) => {
   const dialedSid     = req.body.DialCallSid;
   const call          = store.getCall(clientCallSid);
 
-  console.log('[DialResult] client=' + clientCallSid +
+  console.log('[DialResult V3] client=' + clientCallSid +
               ' status=' + status +
               ' duration=' + duration +
               ' dialedSid=' + dialedSid +
+              ' state=' + call?.state +
               ' fullBody=' + JSON.stringify(req.body));
 
-  // Bridge happened (Todd answered) — we are DONE. No voicemail, no callback.
+  // Bridge happened (any duration > 0) — we are DONE. End the client call.
   if (duration > 0) {
     if (call) store.updateCall(clientCallSid, { state: 'DONE' });
-    console.log('[DialResult] Bridge completed (duration>0) → hanging up client');
+    console.log('[DialResult V3] Bridge completed → hanging up client');
     return res.type('text/xml').send(
       '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
     );
   }
 
-  // Duration is 0 — Todd never answered. Only fallback for definitive failures.
+  // Duration 0 — Todd never bridged. Only treat as "Todd unavailable" for
+  // definitive failure states. Anything else (canceled, completed-with-0,
+  // unknown) → hang up to be safe; we will NEVER recall Todd from here.
   const FAILURE_STATES = ['no-answer', 'busy', 'failed'];
   if (!FAILURE_STATES.includes(status)) {
-    console.log('[DialResult] No bridge but status not a definitive failure → hanging up');
+    console.log('[DialResult V3] Not a definitive failure → hangup');
     return res.type('text/xml').send(
       '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
     );
   }
 
-  // Definitive no-answer/busy/failed AND duration=0 → leave voicemail + AI.
-  console.log('[DialResult] Definitive failure → voicemail + back to AI');
-  if (call && !call.voicemailLeft) {
+  // Todd unavailable. Send client back to AI for callback scheduling.
+  // No outbound call to Todd — the SMS we already sent is sufficient.
+  console.log('[DialResult V3] Todd unavailable (' + status + ') → back to AI');
+  if (call) {
     store.updateCall(clientCallSid, {
       state: 'FALLBACK',
       pendingFallback: true,
-      voicemailLeft: true,
     });
-    twilio.leaveVoicemail({
-      callerName:  call.callerName,
-      callerPhone: call.callerPhone,
-    }).catch(err => console.error('[DialResult] leaveVoicemail error:', err.message));
   }
 
   const wsUrl = process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';

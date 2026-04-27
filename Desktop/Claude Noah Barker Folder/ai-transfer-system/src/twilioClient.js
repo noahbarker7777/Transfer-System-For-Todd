@@ -51,27 +51,34 @@ async function dialAgent(conferenceName, clientCallSid, callerName, callerPhone)
   }
 }
 
-// ── Leave a voicemail for the agent (separate outbound call, silent to client) ─
-async function leaveVoicemail({ callerName, callerPhone }) {
-  const name    = callerName  || 'a potential client';
-  const phone   = callerPhone || 'unknown';
-  const message =
-    'Hi ' + config.AGENT_NAME + ', ' + name + ' called about tax services. ' +
-    'Their number is ' + phone + '. Please give them a call back.';
+// ── SMS the briefing to Todd (no second outbound call to him, ever) ──────────
+// Replaces the legacy leaveVoicemail. We never call Todd a second time in any
+// code path — that was the source of the "phantom callback" the user saw.
+// SMS lands on Todd's phone immediately and silently; he reads it whenever.
+async function smsBriefing({ callerName, callerPhone, context }) {
+  const name  = callerName  || 'a potential client';
+  const phone = callerPhone || 'unknown';
+  const lead  = context === 'pre-transfer'
+    ? 'Incoming transfer'
+    : 'Missed transfer';
+  const body  = lead + ': ' + name + ' (' + phone + ') re: tax services.';
 
   try {
-    const call = await client.calls.create({
+    const msg = await client.messages.create({
       to:   config.AGENT_PHONE,
       from: config.TWILIO_PHONE_NUMBER,
-      twiml: '<Response><Pause length="2"/><Say voice="Polly.Joanna">' +
-             message +
-             '</Say><Hangup/></Response>',
+      body,
     });
-    console.log(`[Twilio] Voicemail call initiated → SID: ${call.sid}`);
-    return call.sid;
+    console.log('[Twilio] SMS briefing sent → SID: ' + msg.sid + ' body=' + body);
+    return msg.sid;
   } catch (err) {
-    console.error('[Twilio] leaveVoicemail error:', err.message);
+    console.error('[Twilio] smsBriefing error:', err.message);
   }
+}
+
+// Legacy export kept so any stray reference from old code can no-op safely.
+async function leaveVoicemail() {
+  console.warn('[Twilio] leaveVoicemail called — IGNORED (legacy path neutralized)');
 }
 
 // ── End any in-progress call leg ──────────────────────────────────────────────
@@ -87,6 +94,7 @@ async function hangupCall(callSid) {
 module.exports = {
   client,
   dialAgent,
-  leaveVoicemail,
+  leaveVoicemail,  // legacy no-op
+  smsBriefing,
   hangupCall,
 };
