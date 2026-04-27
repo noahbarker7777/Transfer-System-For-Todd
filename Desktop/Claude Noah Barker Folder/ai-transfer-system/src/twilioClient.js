@@ -25,9 +25,6 @@ async function dialAgent(conferenceName, clientCallSid, callerName, callerPhone)
     '&phone='   + phoneParam +
     '&callSid=' + encodeURIComponent(clientCallSid);
 
-  const amdCallback = config.SERVER_URL +
-    '/call/amd-result?clientCallSid=' + clientCallSid;
-
   const statusCallback = config.SERVER_URL +
     '/call/status/agent?clientCallSid=' + clientCallSid;
 
@@ -37,11 +34,13 @@ async function dialAgent(conferenceName, clientCallSid, callerName, callerPhone)
       from: config.TWILIO_PHONE_NUMBER,
       url:  agentJoinUrl,
       method: 'POST',
-      timeout: 20,  // ring for max 20s then Twilio sends no-answer
+      timeout: 20,
 
       statusCallback:       statusCallback,
       statusCallbackMethod: 'POST',
-      statusCallbackEvent:  ['initiated', 'ringing', 'in-progress', 'completed'],
+      // 'answered' is the event name Twilio accepts here.
+      // When it fires, CallStatus in the POST body is 'in-progress' — see status.js.
+      statusCallbackEvent:  ['ringing', 'answered', 'completed'],
     });
 
     console.log(`[Twilio] Dialing agent ${config.AGENT_PHONE} → SID: ${call.sid}`);
