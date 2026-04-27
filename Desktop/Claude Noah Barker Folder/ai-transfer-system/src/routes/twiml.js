@@ -3,8 +3,99 @@
 const express = require('express');
 const router  = express.Router();
 const store   = require('../store');
+const twilio  = require('../twilioClient');
 
 const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// ── Warm transfer: redirect client here, Twilio dials Todd with whisper ───────
+// Single TwiML eliminates conference + AMD + status callback race conditions.
+// answerOnBridge gives the client ringback while Todd's phone rings.
+// <Number url=""> plays the whisper privately to Todd before bridging.
+// action fires after dial completes with DialCallStatus → /dial-result decides
+// success vs voicemail/no-answer fallback.
+router.all('/transfer-bridge', (req, res) => {
+  const callSid    = req.query.callSid;
+  const serverUrl  = process.env.SERVER_URL;
+  const todd       = process.env.AGENT_PHONE;
+  const callerId   = process.env.TWILIO_PHONE_NUMBER;
+  const whisperUrl = serverUrl + '/call/agent-whisper?callSid=' + encodeURIComponent(callSid);
+  const actionUrl  = serverUrl + '/call/dial-result?clientCallSid=' + encodeURIComponent(callSid);
+
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response>' +
+      '<Dial answerOnBridge="true" timeout="20" callerId="' + callerId + '" ' +
+            'action="' + actionUrl + '" method="POST">' +
+        '<Number url="' + whisperUrl + '" method="GET">' + todd + '</Number>' +
+      '</Dial>' +
+    '</Response>'
+  );
+});
+
+// ── Whisper played privately to Todd before bridging ──────────────────────────
+// Twilio fetches this when Todd picks up. After <Say> completes, Twilio
+// auto-bridges Todd with the client. AI is gone — no MediaStream, no agent.
+router.all('/agent-whisper', (req, res) => {
+  const callSid   = req.query.callSid || '';
+  const call      = callSid ? store.getCall(callSid) : null;
+  const agentName = process.env.AGENT_NAME || 'Todd';
+  const name      = (call && call.callerName)  ? call.callerName  : 'a client';
+  const phone     = (call && call.callerPhone) ? call.callerPhone : null;
+  const phoneText = phone ? ' Their number is ' + phone + '.' : '';
+  const greeting  = xmlEscape(
+    'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
+    phoneText + ' Go ahead — you are connected!'
+  );
+
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Say voice="Polly.Joanna">' + greeting + '</Say></Response>'
+  );
+});
+
+// ── Dial result: fires once <Dial> completes for any reason ───────────────────
+// DialCallStatus values:
+//   completed  → call bridged successfully and ended naturally → hang up client
+//   answered   → bridged (older Twilio versions) → hang up client
+//   no-answer  → Todd didn't pick up → leave voicemail, return client to AI
+//   busy       → Todd's line busy → voicemail + return to AI
+//   failed     → carrier failure → voicemail + return to AI
+//   canceled   → we canceled before answer → just hang up
+router.post('/dial-result', async (req, res) => {
+  const clientCallSid = req.query.clientCallSid;
+  const status        = req.body.DialCallStatus;
+  const call          = store.getCall(clientCallSid);
+
+  console.log('[DialResult] client=' + clientCallSid + ' DialCallStatus=' + status);
+
+  if (status === 'completed' || status === 'answered') {
+    if (call) store.updateCall(clientCallSid, { state: 'DONE' });
+    return res.type('text/xml').send(
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    );
+  }
+
+  // Transfer didn't bridge — leave Todd a voicemail and send client back to AI.
+  if (call && !call.voicemailLeft) {
+    store.updateCall(clientCallSid, {
+      state: 'FALLBACK',
+      pendingFallback: true,
+      voicemailLeft: true,
+    });
+    twilio.leaveVoicemail({
+      callerName:  call.callerName,
+      callerPhone: call.callerPhone,
+    }).catch(err => console.error('[DialResult] leaveVoicemail error:', err.message));
+  }
+
+  const wsUrl = process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';
+  res.type('text/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Response><Connect><Stream url="' + wsUrl + '">' +
+      '<Parameter name="callSid" value="' + clientCallSid + '" />' +
+    '</Stream></Connect></Response>'
+  );
+});
 
 // ── Hold TwiML served by our own server — no external dependencies ────────────
 // Twilio fetches this as the conference waitUrl while the client waits for agent
