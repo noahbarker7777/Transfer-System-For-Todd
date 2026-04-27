@@ -41,7 +41,7 @@ async function dialAgent(conferenceName, clientCallSid, callerName, callerPhone)
 
       statusCallback:       statusCallback,
       statusCallbackMethod: 'POST',
-      statusCallbackEvent:  ['initiated', 'ringing', 'answered', 'completed'],
+      statusCallbackEvent:  ['initiated', 'ringing', 'in-progress', 'completed'],
     });
 
     console.log(`[Twilio] Dialing agent ${config.AGENT_PHONE} → SID: ${call.sid}`);

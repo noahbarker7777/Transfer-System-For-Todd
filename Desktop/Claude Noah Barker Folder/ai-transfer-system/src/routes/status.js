@@ -42,7 +42,7 @@ router.post('/agent', async (req, res) => {
 
   if (!clientCallSid) return;
 
-  if (CallStatus === 'answered') {
+  if (CallStatus === 'in-progress') {
     const call = store.getCall(clientCallSid);
     if (call && call.state === 'TRANSFERRING') {
       if (call.transferTimer) clearTimeout(call.transferTimer);
