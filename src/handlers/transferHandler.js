@@ -27,13 +27,22 @@ const BUILD_TAG = 'TRANSFER_V3';
 
 async function onTransferSignal(clientCallSid) {
   const call = store.getCall(clientCallSid);
-  if (!call || call.state !== 'QUALIFYING') {
-    console.log(`[Transfer ${BUILD_TAG}] Ignored — state=${call?.state} (need QUALIFYING)`);
+  // aiPipeline pre-locks state to TRANSFERRING the moment [TRANSFER] is parsed
+  // (so background noise can't kick off another AI turn during the audio-flush
+  // delay). By the time we run, state is normally TRANSFERRING. Accept both.
+  if (!call || !['QUALIFYING', 'TRANSFERRING'].includes(call.state)) {
+    console.log(`[Transfer ${BUILD_TAG}] Ignored — state=${call?.state} (need QUALIFYING or TRANSFERRING)`);
+    return;
+  }
+
+  // Idempotency: if SMS was already sent for this call, do not re-enter.
+  if (call.transferStarted) {
+    console.log(`[Transfer ${BUILD_TAG}] Ignored — transfer already started for ${clientCallSid}`);
     return;
   }
 
   console.log(`[Transfer ${BUILD_TAG}] Beginning transfer for ${clientCallSid}`);
-  store.updateCall(clientCallSid, { state: 'TRANSFERRING' });
+  store.updateCall(clientCallSid, { state: 'TRANSFERRING', transferStarted: true });
 
   // 1. SMS Todd the briefing (fire-and-forget; do not block the bridge on this).
   twilio.smsBriefing({
