@@ -60,39 +60,18 @@ async function onTransferSignal(clientCallSid) {
     return;
   }
 
-  // Safety net — if no live answer is confirmed within timeout, fall back gracefully
-  const timer = setTimeout(async () => {
-    const current = store.getCall(clientCallSid);
-    if (current?.state === 'TRANSFERRING' && !current?.agentAnsweredLive) {
-      console.log(`[Transfer] Timeout after ${config.TRANSFER_TIMEOUT_MS}ms — no live answer confirmed → fallback`);
-      await onTransferFailed(clientCallSid);
-    }
-  }, config.TRANSFER_TIMEOUT_MS);
-
-  store.updateCall(clientCallSid, { transferTimer: timer });
+  // no transfer timeout timer — Twilio's own no-answer/busy/failed status handles non-pickup
 }
 
-// ── Step 2A: AMD confirmed human — play greeting then bridge into conference ────
+// ── Step 2A: Agent answered — greeting+conference already serving as first TwiML
 async function onAgentPickedUp(clientCallSid) {
   const call = store.getCall(clientCallSid);
   if (!call || call.state !== 'TRANSFERRING') return;
 
   if (call.transferTimer) clearTimeout(call.transferTimer);
 
-  console.log(`[Transfer] Agent answered — redirecting to greeting + bridge`);
+  console.log(`[Transfer] Agent answered — greeting playing, conference will bridge`);
   store.updateCall(clientCallSid, { state: 'DONE', agentAnsweredLive: true });
-
-  // Interrupt the silent <Pause> on the agent leg and serve the greeting + conference TwiML
-  const bridgeUrl = config.SERVER_URL + '/call/agent-bridge' +
-    '?conf='    + encodeURIComponent(call.conferenceName) +
-    '&callSid=' + encodeURIComponent(clientCallSid);
-
-  try {
-    await twilio.client.calls(call.agentCallSid).update({ url: bridgeUrl, method: 'GET' });
-    console.log('[Transfer] Agent redirected to greeting + conference bridge');
-  } catch (err) {
-    console.error('[Transfer] Failed to redirect agent to bridge:', err.message);
-  }
 
   await logging.logOutcome(clientCallSid, 'transferred');
 }

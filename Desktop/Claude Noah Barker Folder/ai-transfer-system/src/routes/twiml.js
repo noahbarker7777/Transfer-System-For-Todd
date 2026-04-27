@@ -4,6 +4,8 @@ const express = require('express');
 const router  = express.Router();
 const store   = require('../store');
 
+const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 // ── Hold TwiML served by our own server — no external dependencies ────────────
 // Twilio fetches this as the conference waitUrl while the client waits for agent
 router.all('/wait-twiml', (req, res) => {
@@ -41,12 +43,33 @@ router.all('/client-to-conference', (req, res) => {
   );
 });
 
-// ── Agent answers — park silently until 'answered' status fires ───────────────
-// status.js answered handler calls calls.update() to redirect to /agent-bridge
+// ── Agent answers — play briefing immediately then join conference ────────────
+// Greeting plays privately to Todd; client hears hold music until Todd joins.
+// No AMD gate needed — greeting fires the moment Todd picks up.
 router.all('/agent-join-conference', (req, res) => {
+  const conf      = req.query.conf;
+  const callSid   = req.query.callSid || '';
+  const agentName = process.env.AGENT_NAME || 'Todd';
+  const call      = callSid ? store.getCall(callSid) : null;
+
+  const name      = (call && call.callerName)  ? call.callerName  : 'a client';
+  const phone     = (call && call.callerPhone) ? call.callerPhone : null;
+  const phoneText = phone ? ' Their number is ' + phone + '.' : '';
+  const greeting  = xmlEscape(
+    'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
+    phoneText + ' Go ahead — you are connected!'
+  );
+
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Pause length="30"/></Response>'
+    '<Response>' +
+    '<Say voice="Polly.Joanna">' + greeting + '</Say>' +
+    '<Dial><Conference ' +
+      'startConferenceOnEnter="true" ' +
+      'endConferenceOnExit="true" ' +
+      'beep="false">' +
+      conf +
+    '</Conference></Dial></Response>'
   );
 });
 
@@ -80,9 +103,6 @@ router.all('/agent-bridge', (req, res) => {
 });
 
 // ── Private briefing played to agent when they join ───────────────────────────
-// Client does NOT hear this — it plays only on Todd's leg via announceUrl
-const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
 router.all('/agent-greeting', (req, res) => {
   const callSid   = req.query.callSid || '';
   const agentName = process.env.AGENT_NAME || 'Todd';
