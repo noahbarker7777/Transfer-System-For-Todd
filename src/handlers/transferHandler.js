@@ -3,74 +3,128 @@
 /**
  * handlers/transferHandler.js
  *
- * Final architecture — version "SMS-FIRST" (build tag: TRANSFER_V3).
+ * TRANSFER_V4 — CONFERENCE + AMD architecture.
  *
- * The whisper-URL approach was failing at bridge time: Twilio fetches the
- * <Number url="..."> TwiML when the called party answers, and any latency or
- * error on that fetch leaves both lines silent because the bridge never
- * completes. Switching to SMS removes that fetch from the critical path.
+ * On [TRANSFER]:
+ *   1. Send Todd an SMS briefing (fire-and-forget; defense in depth).
+ *   2. Move the client into a unique conference (alone, hold music).
+ *   3. Place a separate outbound call to Todd with machineDetection enabled.
  *
- * Flow:
- *   1. Send Todd an SMS with caller name + phone + topic (instant, silent).
- *   2. Redirect the client call to a bare <Dial> — no whisper, no action URL
- *      side effects, just a plain bridge to Todd's number.
- *   3. When the dial completes for any reason, /dial-result decides: bridge
- *      duration > 0 → hangup cleanly; otherwise → send client back to AI for
- *      callback scheduling. We NEVER place a second outbound call to Todd.
+ * Twilio's AMD result drives the rest:
+ *   - human                 → /agent-pickup speaks briefing then <Dial><Conference>
+ *   - machine_end_*         → /agent-pickup speaks briefing then <Hangup/> (voicemail)
+ *   - never answered        → status callback fires no-answer; client falls back
+ *
+ * Single source of truth: agentJoinedConference (set by conference status
+ * webhook on participant-join). The agent call's completed callback uses this
+ * flag to decide whether to leave the client connected (already bridged) or
+ * fall back (voicemail / no-answer / abandoned briefing).
+ *
+ * Idempotency: transferStarted prevents double-fire from any retry path.
  */
 
 const store  = require('../store');
 const twilio = require('../twilioClient');
 const config = require('../config');
 
-const BUILD_TAG = 'TRANSFER_V3';
+const BUILD_TAG = 'TRANSFER_V4';
 
 async function onTransferSignal(clientCallSid) {
   const call = store.getCall(clientCallSid);
+  if (!call) {
+    console.log('[Transfer ' + BUILD_TAG + '] Ignored — no call ' + clientCallSid);
+    return;
+  }
+
   // aiPipeline pre-locks state to TRANSFERRING the moment [TRANSFER] is parsed
-  // (so background noise can't kick off another AI turn during the audio-flush
-  // delay). By the time we run, state is normally TRANSFERRING. Accept both.
-  if (!call || !['QUALIFYING', 'TRANSFERRING'].includes(call.state)) {
-    console.log(`[Transfer ${BUILD_TAG}] Ignored — state=${call?.state} (need QUALIFYING or TRANSFERRING)`);
+  // so background-noise transcripts can't kick off another AI turn.
+  if (!['QUALIFYING', 'TRANSFERRING'].includes(call.state)) {
+    console.log('[Transfer ' + BUILD_TAG + '] Ignored — state=' + call.state);
     return;
   }
 
-  // Idempotency: if SMS was already sent for this call, do not re-enter.
   if (call.transferStarted) {
-    console.log(`[Transfer ${BUILD_TAG}] Ignored — transfer already started for ${clientCallSid}`);
+    console.log('[Transfer ' + BUILD_TAG + '] Ignored — already started for ' + clientCallSid);
     return;
   }
 
-  console.log(`[Transfer ${BUILD_TAG}] Beginning transfer for ${clientCallSid}`);
-  store.updateCall(clientCallSid, { state: 'TRANSFERRING', transferStarted: true });
+  const conferenceName = 'conf-' + clientCallSid;
 
-  // 1. SMS Todd the briefing (fire-and-forget; do not block the bridge on this).
+  store.updateCall(clientCallSid, {
+    state: 'TRANSFERRING',
+    transferStarted: true,
+    conferenceName,
+    agentCallSid: null,
+    agentJoinedConference: false,
+    agentAnsweredBy: null,
+    fallbackTriggered: false,
+  });
+
+  console.log('[Transfer ' + BUILD_TAG + '] Beginning transfer for ' + clientCallSid +
+              ' name="' + (call.callerName || '') + '"' +
+              ' phone="' + (call.callerPhone || '') + '"' +
+              ' taxType="' + (call.taxType || '') + '"');
+
+  // 1. SMS Todd — fire-and-forget so it never blocks the call flow.
   twilio.smsBriefing({
     callerName:  call.callerName,
     callerPhone: call.callerPhone,
+    taxType:     call.taxType,
     context:     'pre-transfer',
-  }).catch(err => console.error(`[Transfer ${BUILD_TAG}] SMS error:`, err.message));
+  }).catch(err => console.error('[Transfer ' + BUILD_TAG + '] SMS error:', err.message));
 
-  // 2. Redirect the client call to the bare bridge TwiML.
+  // 2. Move the client into the conference (alone, hold music).
+  const moveUrl = config.SERVER_URL + '/call/move-client?' + new URLSearchParams({
+    conf: conferenceName,
+    clientCallSid,
+  }).toString();
+
   try {
-    await twilio.client.calls(clientCallSid).update({
-      url:    config.SERVER_URL + '/call/transfer-bridge?callSid=' + encodeURIComponent(clientCallSid),
-      method: 'POST',
-    });
-    console.log(`[Transfer ${BUILD_TAG}] Client redirected to /call/transfer-bridge`);
+    await twilio.redirectCall(clientCallSid, moveUrl);
   } catch (err) {
-    console.error(`[Transfer ${BUILD_TAG}] Redirect failed:`, err.message);
+    console.error('[Transfer ' + BUILD_TAG + '] Failed to move client to conference:', err.message);
+    return;
+  }
+
+  // 3. Dial Todd with AMD. The status webhook drives every downstream branch.
+  try {
+    const agentSid = await twilio.dialAgentWithAMD({
+      clientCallSid,
+      conferenceName,
+    });
+    store.updateCall(clientCallSid, { agentCallSid: agentSid });
+  } catch (err) {
+    console.error('[Transfer ' + BUILD_TAG + '] Dial-Todd failed:', err.message);
+    // Hard fail at the dial step — pull the client back to AI immediately.
+    await triggerClientFallback(clientCallSid, 'dial-failed');
   }
 }
 
-// Legacy no-ops — old in-flight calls' callbacks may still hit these handlers.
-async function onAgentPickedUp() {}
-async function onVoicemailDetected() {}
-async function onTransferFailed() {}
+// ── Fallback: redirect client out of conference and back into MediaStream ─────
+// Called from status webhooks when Todd never bridges (voicemail / no-answer /
+// abandoned briefing). Idempotent — if fallbackTriggered is already true, no-op.
+async function triggerClientFallback(clientCallSid, reason) {
+  const call = store.getCall(clientCallSid);
+  if (!call) return;
+  if (call.fallbackTriggered) return;
+
+  store.updateCall(clientCallSid, {
+    fallbackTriggered: true,
+    fallbackReason: reason,        // distinguishes voicemail vs no-answer in CRM logs
+    state: 'FALLBACK',
+    pendingFallback: true,
+  });
+
+  console.log('[Transfer ' + BUILD_TAG + '] Client fallback (' + reason + ') for ' + clientCallSid);
+
+  const url = config.SERVER_URL + '/call/back-to-ai?' + new URLSearchParams({
+    clientCallSid,
+  }).toString();
+
+  await twilio.redirectCall(clientCallSid, url);
+}
 
 module.exports = {
   onTransferSignal,
-  onAgentPickedUp,
-  onVoicemailDetected,
-  onTransferFailed,
+  triggerClientFallback,
 };

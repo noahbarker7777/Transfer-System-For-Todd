@@ -12,9 +12,29 @@
 const config = require('../config');
 const store  = require('../store');
 
+// Map the in-memory call state to the discrete outcome strings used by the
+// CRM logger. Callers pass in `call.state` (DONE / FALLBACK / QUALIFYING /
+// GREETING / TRANSFERRING) — those don't match the HubSpot/Airtable schema.
+function stateToOutcome(state, fallbackReason) {
+  switch (state) {
+    case 'DONE':
+    case 'CONNECTED':    return 'transferred';
+    case 'FALLBACK':
+      // Refine using fallbackReason set by triggerClientFallback.
+      return fallbackReason === 'voicemail' ? 'voicemail_left' : 'no_answer';
+    case 'TRANSFERRING': return 'no_answer';   // bridge attempt that never finalized
+    default:             return 'completed';   // GREETING / QUALIFYING / unknown
+  }
+}
+
 // ── Main log function ─────────────────────────────────────────────────────────
-async function logOutcome(callSid, outcome, durationSeconds) {
+async function logOutcome(callSid, stateOrOutcome, durationSeconds) {
   const call = store.getCall(callSid);
+  // Accept either a raw state ('DONE', 'FALLBACK', ...) or a pre-mapped outcome.
+  const KNOWN_OUTCOMES = ['transferred', 'voicemail_left', 'no_answer', 'completed'];
+  const outcome = KNOWN_OUTCOMES.includes(stateOrOutcome)
+    ? stateOrOutcome
+    : stateToOutcome(stateOrOutcome, call?.fallbackReason);
 
   const record = {
     callSid,
@@ -27,7 +47,7 @@ async function logOutcome(callSid, outcome, durationSeconds) {
     agentName:       config.AGENT_NAME,
   };
 
-  console.log(`[Logging] Outcome: ${outcome} for call ${callSid}`, record);
+  console.log(`[Logging] Outcome: ${outcome} (state=${stateOrOutcome}) for call ${callSid}`, record);
 
   // Run both in parallel (whichever is configured will succeed)
   await Promise.allSettled([
@@ -41,8 +61,6 @@ async function logToHubSpot(record) {
   if (!config.HUBSPOT_API_KEY) return;  // skip if not configured
 
   try {
-    const fetch = (await import('node-fetch')).default;
-
     // 1. Create or update contact
     const contactPayload = {
       properties: {
@@ -109,8 +127,6 @@ async function logToAirtable(record) {
   if (!config.AIRTABLE_API_KEY || !config.AIRTABLE_BASE_ID) return;
 
   try {
-    const fetch = (await import('node-fetch')).default;
-
     await fetch(
       `https://api.airtable.com/v0/${config.AIRTABLE_BASE_ID}/Calls`,
       {

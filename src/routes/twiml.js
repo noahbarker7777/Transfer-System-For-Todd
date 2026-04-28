@@ -1,249 +1,225 @@
 'use strict';
 
+/**
+ * routes/twiml.js — TRANSFER_V4 (CONFERENCE+AMD)
+ *
+ * Routes:
+ *   POST/GET /move-client    — moves the client into the conference (hold music)
+ *   POST     /agent-pickup   — Twilio fires this once Todd's call is answered;
+ *                              AnsweredBy decides bridge-vs-voicemail
+ *   GET/ALL  /wait-music     — hold-music TwiML for the client side
+ *   GET/ALL  /back-to-ai     — opens a fresh MediaStream so AI can deliver fallback
+ *
+ * No legacy routes. Anything not in this file no longer exists.
+ */
+
 const express = require('express');
 const router  = express.Router();
 const store   = require('../store');
-const twilio  = require('../twilioClient');
+const config  = require('../config');
 
-const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const xmlEscape = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// ── Warm transfer: bare bridge (build tag TRANSFER_V3) ────────────────────────
-// No <Number url="whisper"> — that fetch was the bridge-failure point. The
-// briefing was already sent to Todd via SMS in transferHandler before this
-// runs, so when he answers his phone, both lines bridge instantly with no
-// dependency on a webhook fetch completing in time.
-router.all('/transfer-bridge', (req, res) => {
-  const callSid   = req.query.callSid;
-  const serverUrl = process.env.SERVER_URL;
-  const todd      = process.env.AGENT_PHONE;
-  const callerId  = process.env.TWILIO_PHONE_NUMBER;
-  const actionUrl = serverUrl + '/call/dial-result?clientCallSid=' + encodeURIComponent(callSid);
+// 'alice' is Twilio's universally-available legacy voice — works on every
+// account, no Polly/Google TTS dependency. Previous Polly.Joanna attempts
+// rendered silently in production for unclear reasons; alice is the safe pick.
+const VOICE = 'alice';
 
-  console.log('[transfer-bridge V3] callSid=' + callSid + ' todd=' + todd);
+// Build the briefing Todd hears. Returns an array of TwiML <Say>/<Pause> chunks
+// because the human-pickup case needs short sentences with breathing room — a
+// single long <Say> blew past Todd while he was still saying "hello".
+function briefingChunks({ callerName, callerPhone, taxType }, mode) {
+  const agent   = config.AGENT_NAME || 'Todd';
+  const company = config.COMPANY_NAME || 'Frazier Industries';
+  const name    = callerName  || 'a client';
+  const subject = taxType ? (taxType + ' taxes') : 'tax services';
+
+  if (mode === 'voicemail') {
+    const digits = String(callerPhone || '').replace(/\D/g, '');
+    const phone  = digits.length >= 10
+      ? ('. Their callback number is ' + spellPhone(digits))
+      : '';
+    return [
+      // Long pause first so any tail of the greeting/beep is past before we speak.
+      { kind: 'pause', length: 2 },
+      { kind: 'say',   text: 'Hi ' + agent + ', this is your ' + company + ' assistant.' },
+      { kind: 'say',   text: name + ' just called about ' + subject + phone + '.' },
+      { kind: 'say',   text: 'Please call them back as soon as you can. Goodbye.' },
+    ];
+  }
+  // Human bridge — pace the briefing so Todd hears it clearly even if he was
+  // still mid-"hello" when the audio path opened.
+  return [
+    { kind: 'pause', length: 1 },
+    { kind: 'say',   text: 'Hi ' + agent + ', it\'s your assistant.' },
+    { kind: 'pause', length: 1 },
+    { kind: 'say',   text: name + ' is on the line about ' + subject + '.' },
+    { kind: 'pause', length: 1 },
+    { kind: 'say',   text: 'Connecting you now.' },
+  ];
+}
+
+function chunksToTwiml(chunks) {
+  return chunks.map(c => c.kind === 'pause'
+    ? '<Pause length="' + c.length + '"/>'
+    : '<Say voice="' + VOICE + '">' + xmlEscape(c.text) + '</Say>'
+  ).join('');
+}
+
+// Speak phone numbers digit-by-digit so Polly doesn't read "7145551234" as a year.
+function spellPhone(p) {
+  return String(p).replace(/\D/g, '').split('').join(' ');
+}
+
+// ── Move the client into the conference (alone, with hold music) ──────────────
+// Speaks a clear "please hold" cue first so the caller hears something
+// continuous in the gap between Eryn's last words and the conference music.
+// Without this, the caller perceives the silent redirect as "the AI is dialing".
+router.all('/move-client', (req, res) => {
+  const conf            = req.query.conf || req.body.conf;
+  const clientCallSid   = req.query.clientCallSid || req.body.clientCallSid;
+  const agent           = config.AGENT_NAME || 'Todd';
+  const serverUrl       = process.env.SERVER_URL;
+  const waitUrl         = serverUrl + '/call/wait-music';
+  const confStatusUrl   = serverUrl + '/call/status/conference?clientCallSid=' +
+                          encodeURIComponent(clientCallSid || '');
+
+  console.log('[move-client V4] callSid=' + clientCallSid + ' conf=' + conf);
 
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-      '<Dial answerOnBridge="true" timeout="20" callerId="' + callerId + '" ' +
-            'action="' + actionUrl + '" method="POST">' +
-        todd +
+      '<Say voice="' + VOICE + '">Please hold for just a moment while I bring ' +
+        xmlEscape(agent) + ' on the line.</Say>' +
+      '<Dial>' +
+        '<Conference ' +
+          'startConferenceOnEnter="false" ' +
+          'endConferenceOnExit="true" ' +    // client hangup ends conference
+          'beep="false" ' +
+          'waitUrl="' + waitUrl + '" waitMethod="GET" ' +
+          'statusCallback="' + confStatusUrl + '" ' +
+          'statusCallbackMethod="POST" ' +
+          'statusCallbackEvent="join leave end">' +
+          xmlEscape(conf) +
+        '</Conference>' +
       '</Dial>' +
     '</Response>'
   );
 });
 
-// ── Legacy whisper endpoint (kept as harmless silence in case Twilio hits it) ─
-router.all('/agent-whisper', (req, res) => {
-  console.log('[agent-whisper LEGACY] hit — returning empty response');
-  res.type('text/xml').send(
-    '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
-  );
-});
-
-// ── Dial result: fires once <Dial> completes for any reason ───────────────────
-// HARD GUARANTEE: this route NEVER places an outbound call to Todd. The only
-// outcomes are (a) hang up the client, or (b) reconnect client to AI for
-// scheduling. The Todd briefing was already SMSed before the dial; if he
-// missed the live call, the SMS already told him who called and why.
-router.post('/dial-result', async (req, res) => {
-  const clientCallSid = req.query.clientCallSid;
-  const status        = req.body.DialCallStatus;
-  const duration      = parseInt(req.body.DialCallDuration || '0', 10);
-  const dialedSid     = req.body.DialCallSid;
-  const call          = store.getCall(clientCallSid);
-
-  console.log('[DialResult V3] client=' + clientCallSid +
-              ' status=' + status +
-              ' duration=' + duration +
-              ' dialedSid=' + dialedSid +
-              ' state=' + call?.state +
-              ' fullBody=' + JSON.stringify(req.body));
-
-  // Bridge happened (any duration > 0) — we are DONE. End the client call.
-  if (duration > 0) {
-    if (call) store.updateCall(clientCallSid, { state: 'DONE' });
-    console.log('[DialResult V3] Bridge completed → hanging up client');
-    return res.type('text/xml').send(
-      '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-    );
-  }
-
-  // Duration 0 — Todd never bridged. Only treat as "Todd unavailable" for
-  // definitive failure states. Anything else (canceled, completed-with-0,
-  // unknown) → hang up to be safe; we will NEVER recall Todd from here.
-  const FAILURE_STATES = ['no-answer', 'busy', 'failed'];
-  if (!FAILURE_STATES.includes(status)) {
-    console.log('[DialResult V3] Not a definitive failure → hangup');
-    return res.type('text/xml').send(
-      '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-    );
-  }
-
-  // Todd unavailable. Send client back to AI for callback scheduling.
-  // No outbound call to Todd — the SMS we already sent is sufficient.
-  console.log('[DialResult V3] Todd unavailable (' + status + ') → back to AI');
-  if (call) {
-    store.updateCall(clientCallSid, {
-      state: 'FALLBACK',
-      pendingFallback: true,
-    });
-  }
-
-  const wsUrl = process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';
-  res.type('text/xml').send(
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Connect><Stream url="' + wsUrl + '">' +
-      '<Parameter name="callSid" value="' + clientCallSid + '" />' +
-    '</Stream></Connect></Response>'
-  );
-});
-
-// ── Hold TwiML served by our own server — no external dependencies ────────────
-// Twilio fetches this as the conference waitUrl while the client waits for agent
-router.all('/wait-twiml', (req, res) => {
+// ── Hold music while the client waits for Todd to be reached ──────────────────
+router.all('/wait-music', (req, res) => {
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-      '<Say voice="Polly.Joanna">Please hold for just a moment.</Say>' +
-      '<Pause length="60"/>' +
+      '<Play loop="0">https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3</Play>' +
     '</Response>'
   );
 });
 
-// ── Client moves into conference (hold music plays while waiting for agent) ───
-// Called via calls(sid).update() when [TRANSFER] fires
-// clientCallSid is passed so the conference statusCallback can route events back
-router.all('/client-to-conference', (req, res) => {
-  const conf             = req.query.conf;
-  const clientCallSid    = encodeURIComponent(req.query.clientCallSid || '');
-  const serverUrl        = process.env.SERVER_URL;
-  const waitUrl          = serverUrl + '/call/wait-twiml';
-  const statusCallbackUrl = serverUrl + '/call/status/conference?clientCallSid=' + clientCallSid;
+// ── Twilio invokes this once Todd's call is answered (and AMD has finished) ───
+// AnsweredBy values: human, machine_start, machine_end_beep, machine_end_silence,
+// machine_end_other, fax, unknown.
+//
+// HUMAN BRANCH (the critical one):
+//   We do NOT inline <Say> + <Dial> in the same TwiML. Twilio is supposed to
+//   execute verbs in order, but in production the briefing was being skipped
+//   while the bridge still happened — Todd was dropped onto the call cold.
+//   The fix: wrap the briefing in <Gather>, which Twilio guarantees plays its
+//   prompt fully before moving on, then <Redirect> to a SEPARATE /agent-bridge
+//   endpoint that does only the conference dial. Even if a single <Say> ever
+//   fails silently, the bridge URL isn't fetched until the briefing TwiML has
+//   completed end-to-end. Todd cannot reach the bridge before the briefing.
+//
+// VOICEMAIL BRANCH:
+//   Long leading <Pause> to step over the start of the greeting tail, then
+//   speak the message and hang up.
+router.post('/agent-pickup', (req, res) => {
+  const conf          = req.query.conf;
+  const clientCallSid = req.query.clientCallSid;
+  const answeredBy    = (req.body.AnsweredBy || '').toLowerCase();
+  const call          = clientCallSid ? store.getCall(clientCallSid) : null;
 
-  res.type('text/xml').send(
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Dial><Conference ' +
-      'waitUrl="' + waitUrl + '" waitMethod="GET" ' +
-      'startConferenceOnEnter="false" ' +
-      'endConferenceOnExit="true" ' +
-      'beep="false" ' +
-      'statusCallbackUrl="' + statusCallbackUrl + '" ' +
-      'statusCallbackMethod="POST" ' +
-      'statusCallbackEvent="conference-start">' +
-      conf +
-    '</Conference></Dial></Response>'
-  );
-});
+  console.log('[agent-pickup V4] client=' + clientCallSid +
+              ' answeredBy=' + answeredBy +
+              ' fullBody=' + JSON.stringify(req.body));
 
-// ── Agent answers — play briefing immediately then join conference ────────────
-// Greeting plays privately to Todd; client hears hold music until Todd joins.
-// No AMD gate needed — greeting fires the moment Todd picks up.
-router.all('/agent-join-conference', (req, res) => {
-  const conf      = req.query.conf;
-  const callSid   = req.query.callSid || '';
-  const agentName = process.env.AGENT_NAME || 'Todd';
-  const call      = callSid ? store.getCall(callSid) : null;
+  if (call) store.updateCall(clientCallSid, { agentAnsweredBy: answeredBy || 'unknown' });
 
-  const name      = (call && call.callerName)  ? call.callerName  : 'a client';
-  const phone     = (call && call.callerPhone) ? call.callerPhone : null;
-  const phoneText = phone ? ' Their number is ' + phone + '.' : '';
-  const greeting  = xmlEscape(
-    'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
-    phoneText + ' Go ahead — you are connected!'
-  );
+  const briefingPayload = {
+    callerName:  call?.callerName,
+    callerPhone: call?.callerPhone,
+    taxType:     call?.taxType,
+  };
 
+  // Voicemail branch — anything starting with "machine", plus 'fax' and 'unknown'.
+  const isMachine = answeredBy.startsWith('machine') ||
+                    answeredBy === 'fax' ||
+                    answeredBy === 'unknown';
+
+  if (isMachine) {
+    const body = chunksToTwiml(briefingChunks(briefingPayload, 'voicemail'));
+    console.log('[agent-pickup V4] machine detected → leaving voicemail');
+    return res.type('text/xml').send(
+      '<?xml version="1.0" encoding="UTF-8"?>' +
+      '<Response>' + body + '<Hangup/></Response>'
+    );
+  }
+
+  // Human pickup — Gather forces briefing to play in full before /agent-bridge
+  // is fetched. Both paths (Todd presses any digit, or Gather times out) lead
+  // to the same /agent-bridge endpoint; bridge happens AFTER the briefing.
+  const bridgeUrl = process.env.SERVER_URL + '/call/agent-bridge?' +
+                    new URLSearchParams({ conf, clientCallSid }).toString();
+  const briefing  = chunksToTwiml(briefingChunks(briefingPayload, 'human'));
+
+  console.log('[agent-pickup V4] human → briefing fence then /agent-bridge');
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-    '<Say voice="Polly.Joanna">' + greeting + '</Say>' +
-    '<Dial><Conference ' +
-      'startConferenceOnEnter="true" ' +
-      'endConferenceOnExit="true" ' +
-      'beep="false">' +
-      conf +
-    '</Conference></Dial></Response>'
+      '<Gather numDigits="1" timeout="3" finishOnKey="" ' +
+              'action="' + bridgeUrl + '" method="POST">' +
+        briefing +
+      '</Gather>' +
+      // If Gather times out without a key press, redirect to bridge anyway.
+      '<Redirect method="POST">' + bridgeUrl + '</Redirect>' +
+    '</Response>'
   );
 });
 
-// ── Agent greeting + conference bridge ────────────────────────────────────────
-// Served via calls.update() once answered status fires
+// ── Bridge endpoint — only reached after /agent-pickup's Gather completes ─────
+// Sole responsibility: drop Todd's call leg into the conference. By the time
+// Twilio fetches this URL, the briefing has fully played.
 router.all('/agent-bridge', (req, res) => {
-  const conf      = req.query.conf;
-  const callSid   = req.query.callSid || '';
-  const agentName = process.env.AGENT_NAME || 'Todd';
-  const call      = callSid ? store.getCall(callSid) : null;
-
-  const name      = (call && call.callerName)  ? call.callerName  : 'a client';
-  const phone     = (call && call.callerPhone) ? call.callerPhone : null;
-  const phoneText = phone ? ' Their number is ' + phone + '.' : '';
-  const greeting  = xmlEscape(
-    'Hi ' + agentName + ', ' + name + ' is on the line about tax planning services.' +
-    phoneText + ' Go ahead — you are connected!'
-  );
-
+  const conf          = req.query.conf || req.body.conf;
+  const clientCallSid = req.query.clientCallSid || req.body.clientCallSid;
+  console.log('[agent-bridge V4] client=' + clientCallSid + ' conf=' + conf +
+              ' digits=' + (req.body.Digits || ''));
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-    '<Say voice="Polly.Joanna">' + greeting + '</Say>' +
-    '<Dial><Conference ' +
-      'startConferenceOnEnter="true" ' +
-      'endConferenceOnExit="true" ' +
-      'beep="false">' +
-      conf +
-    '</Conference></Dial></Response>'
+      '<Dial>' +
+        '<Conference ' +
+          'startConferenceOnEnter="true" ' +
+          'endConferenceOnExit="true" ' +
+          'beep="false">' +
+          xmlEscape(conf) +
+        '</Conference>' +
+      '</Dial>' +
+    '</Response>'
   );
 });
 
-// ── Private briefing played to agent when they join ───────────────────────────
-router.all('/agent-greeting', (req, res) => {
-  const callSid   = req.query.callSid || '';
-  const agentName = process.env.AGENT_NAME || 'Todd';
-  const call      = callSid ? store.getCall(callSid) : null;
-
-  const raw = call && call.callerSummary
-    ? call.callerSummary
-    : 'I have ' + (call && call.callerName ? call.callerName : 'a client') +
-      ' on the line. They are interested in tax planning services.' +
-      (call && call.callerPhone ? ' Their number is ' + call.callerPhone + '.' : '');
-
-  res.type('text/xml').send(
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Say voice="Polly.Joanna">' +
-      'Hi ' + agentName + ', ' + xmlEscape(raw) + ' Go ahead — you are connected!' +
-    '</Say></Response>'
-  );
-});
-
-// ── Polite goodbye when Todd doesn't answer — Eryn's job is done ─────────────
-router.all('/goodbye-twiml', (req, res) => {
-  const company = process.env.COMPANY_NAME || 'Frazier Industries';
-  res.type('text/xml').send(
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Say voice="Polly.Joanna">' +
-      'Thank you for calling ' + company + '. Todd will be in touch with you shortly. Have a great day!' +
-    '</Say><Hangup/></Response>'
-  );
-});
-
-// ── Return client to AI after a failed transfer (voicemail / no-answer) ───────
-// Opens a fresh MediaStream WebSocket; server resumes AI from saved history
+// ── Pull the client back into MediaStream so Eryn can deliver the fallback ────
 router.all('/back-to-ai', (req, res) => {
-  const callSid = req.query.callSid;
-  const wsUrl   = process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';
-
+  const clientCallSid = req.query.clientCallSid || req.body.clientCallSid;
+  const wsUrl = process.env.SERVER_URL.replace(/^https/, 'wss') + '/media-stream';
+  console.log('[back-to-ai V4] callSid=' + clientCallSid);
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response><Connect><Stream url="' + wsUrl + '">' +
-      '<Parameter name="callSid" value="' + callSid + '" />' +
+      '<Parameter name="callSid" value="' + xmlEscape(clientCallSid || '') + '" />' +
     '</Stream></Connect></Response>'
-  );
-});
-
-// ── Legacy hold music (kept for reference) ────────────────────────────────────
-router.all('/hold-twiml', (req, res) => {
-  res.type('text/xml').send(
-    '<?xml version="1.0" encoding="UTF-8"?>' +
-    '<Response><Play loop="10">https://com.twilio.music.classical.s3.amazonaws.com/BachGavotteShort.mp3</Play></Response>'
   );
 });
 

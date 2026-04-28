@@ -1,16 +1,22 @@
 'use strict';
 
-// ── Call state store ──────────────────────────────────────────────────────────
-// One entry per active call.
-// Shape: { state, conferenceName, callerNumber, aiLegSid, agentLegSid, streamSid, timer }
+// ── Call state store (TRANSFER_V4) ────────────────────────────────────────────
+// One entry per active client call (initialized in routes/inbound.js).
+//
+// Shape:
+//   state, callerNumber, callerPhone, callerName, taxType,
+//   transferStarted, conferenceName, agentCallSid,
+//   agentJoinedConference, agentAnsweredBy,
+//   fallbackTriggered, fallbackReason, pendingFallback,
+//   streamSid, recordingUrl
 //
 // Valid states:
 //   GREETING      — AI answered, sending opening greeting
-//   QUALIFYING    — AI is qualifying the caller
-//   TRANSFERRING  — Agent is being dialed, hold music playing, AI muted
-//   CONNECTED     — Agent picked up, both parties bridged, AI doing intro
-//   FALLBACK      — Transfer failed, AI returned to caller
-//   DONE          — Call ended and logged
+//   QUALIFYING    — AI is collecting name/phone/taxType
+//   TRANSFERRING  — Locked while moving client to conference and dialing Todd
+//   CONNECTED     — Conference participant-join confirmed Todd bridged
+//   FALLBACK      — Transfer failed; AI redelivering on a fresh MediaStream
+//   DONE          — Bridge ended cleanly
 
 const calls           = new Map(); // callSid → call object
 const conversations   = new Map(); // callSid → message history array for Haiku
@@ -56,6 +62,14 @@ function setMediaConnection(callSid, ws) {
   mediaConnections.set(callSid, ws);
 }
 
+// Only delete if the stored ws is the one that closed — a fallback reconnect
+// may have already registered a fresh socket for the same callSid.
+function deleteMediaConnection(callSid, ws) {
+  if (!ws || mediaConnections.get(callSid) === ws) {
+    mediaConnections.delete(callSid);
+  }
+}
+
 module.exports = {
   getCall,
   setCall,
@@ -65,4 +79,5 @@ module.exports = {
   addMessage,
   getMediaConnection,
   setMediaConnection,
+  deleteMediaConnection,
 };

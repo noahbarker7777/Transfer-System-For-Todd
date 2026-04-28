@@ -1,7 +1,7 @@
 'use strict';
 
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
-const { getCall, updateCall, setMediaConnection } = require('../store');
+const { getCall, updateCall, setMediaConnection, deleteMediaConnection } = require('../store');
 const { onClientUtterance, stopCurrentAudio }     = require('./aiPipeline');
 
 function handleMediaStream(ws, req) {
@@ -92,7 +92,11 @@ function handleMediaStream(ws, req) {
           }
 
           if (data.speech_final) {
-            const full = pendingTranscript || transcript;
+            // If speech_final arrived without is_final on this packet, the new
+            // chunk hasn't been folded in yet — append it now to avoid losing it.
+            const full = data.is_final
+              ? pendingTranscript
+              : (pendingTranscript ? pendingTranscript + ' ' + transcript : transcript);
             pendingTranscript = '';
             stopCurrentAudio(callSid);
             onClientUtterance(callSid, full);
@@ -151,6 +155,9 @@ function handleMediaStream(ws, req) {
   ws.on('close', () => {
     console.log('[media] WebSocket closed — callSid=' + callSid);
     if (dgConnection) dgConnection.finish();
+    // Drop the dead WS reference. A reconnect (e.g. fallback flow) will register
+    // its own fresh socket via setMediaConnection in the 'start' handler.
+    if (callSid) deleteMediaConnection(callSid, ws);
   });
 
   ws.on('error', (err) => {

@@ -5,8 +5,9 @@ const fs        = require('fs');
 const path      = require('path');
 const https     = require('https');
 const store     = require('../store');
+const config    = require('../config');
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
 
 const AGENT_SYSTEM_PROMPT = fs.readFileSync(
   path.join(__dirname, '../../system-prompt.txt'),
@@ -32,7 +33,7 @@ async function onClientUtterance(callSid, transcript) {
   } else if (transcript === '__fallback__') {
     // Triggered automatically after a failed transfer reconnects the AI stream
     userMessage =
-      'The transfer to ' + (process.env.AGENT_NAME || 'Todd') +
+      'The transfer to ' + config.AGENT_NAME +
       ' did not go through — he is unavailable right now. ' +
       'Deliver the fallback message from your script naturally and without hesitation. ' +
       'Then offer to schedule a callback appointment so he can reach the client directly.';
@@ -40,13 +41,16 @@ async function onClientUtterance(callSid, transcript) {
     userMessage = transcript;
   }
 
-  store.addMessage(callSid, 'user', userMessage);
-  const history = store.getConversation(callSid).filter(m => m.content !== '__init__');
+  // Build the messages array WITHOUT mutating saved history yet — if the API
+  // call throws, we don't want a dangling user turn that desyncs Anthropic's
+  // strict alternation requirement on the next call.
+  const baseHistory = store.getConversation(callSid).filter(m => m.content !== '__init__');
+  const history     = [...baseHistory, { role: 'user', content: userMessage }];
 
   try {
     const response = await anthropic.messages.create({
-      model:      process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5',
-      max_tokens: parseInt(process.env.MAX_RESPONSE_TOKENS || '150'),
+      model:      config.ANTHROPIC_MODEL,
+      max_tokens: config.MAX_RESPONSE_TOKENS,
       system:     AGENT_SYSTEM_PROMPT,
       messages:   history,
     });
@@ -54,41 +58,66 @@ async function onClientUtterance(callSid, transcript) {
     let aiText = response.content[0].text;
     console.log('[haiku] Response: "' + aiText + '"');
 
-    // Parse [TRANSFER|name=First Last|phone=1234567890] signal
-    // Also accepts bare [TRANSFER] — name/phone extracted from conversation below
+    // Parse [TRANSFER|key=value|key=value|...] — order-insensitive, optional fields.
+    // Recognized keys: name, phone, taxType.
     let shouldTransfer = false;
-    const transferMatch = aiText.match(/\[TRANSFER(?:\|name=([^|\]]+))?(?:\|phone=([^|\]]+))?\]/);
+    const transferMatch = aiText.match(/\[TRANSFER((?:\|[^\]]+)*)\]/);
     if (transferMatch) {
       shouldTransfer = true;
-      const callerName  = (transferMatch[1] || '').trim();
-      const callerPhone = (transferMatch[2] || '').trim();
-      if (callerName)  store.updateCall(callSid, { callerName });
-      if (callerPhone) store.updateCall(callSid, { callerPhone });
-      aiText = aiText.replace(transferMatch[0], '').trim();
+      const fields = {};
+      (transferMatch[1] || '')
+        .split('|')
+        .filter(Boolean)
+        .forEach(pair => {
+          const eq = pair.indexOf('=');
+          if (eq < 0) return;
+          fields[pair.slice(0, eq).trim().toLowerCase()] = pair.slice(eq + 1).trim();
+        });
 
-      // Fallback: if name or phone missing, mine them from the conversation history
+      const updates = {};
+      if (fields.name)    updates.callerName  = fields.name;
+      if (fields.phone)   updates.callerPhone = fields.phone;
+      if (fields.taxtype) updates.taxType     = normalizeTaxType(fields.taxtype);
+      if (Object.keys(updates).length) store.updateCall(callSid, updates);
+
+      // Strip ALL transfer tokens — defends against the model emitting more than one.
+      aiText = aiText.replace(/\[TRANSFER[^\]]*\]/g, '').trim();
+
+      // If the model omitted name/phone/taxType, mine them from the conversation
+      // history BEFORE the briefing fires, so Todd hears the right details.
       const current = store.getCall(callSid);
-      if (!current.callerName || !current.callerPhone) {
-        extractCallerInfo(callSid, history);
+      if (!current.callerName || !current.callerPhone || !current.taxType) {
+        await extractCallerInfo(callSid, history);
       }
     }
 
+    // Persist both turns only after a successful API response.
+    store.addMessage(callSid, 'user',      userMessage);
     store.addMessage(callSid, 'assistant', aiText);
 
     // Speak the response before triggering the transfer so the client hears it
     const audioBytes = await speakToClient(callSid, aiText);
 
     if (shouldTransfer) {
+      // Only honor [TRANSFER] tokens emitted during qualification. If the model
+      // hallucinates a token during FALLBACK or after we've already locked the
+      // state to TRANSFERRING, ignoring it keeps the call from getting wedged.
       const current = store.getCall(callSid);
       if (current && current.state === 'QUALIFYING') {
-        // Lock state immediately so any background noise doesn't trigger a new AI turn
+        // Lock state immediately so any background-noise transcript can't kick
+        // off a new AI turn during the audio-flush delay.
         store.updateCall(callSid, { state: 'TRANSFERRING' });
-        // Wait for Twilio to finish playing buffered audio: mulaw is 8000 bytes/sec
-        const audioMs = audioBytes ? Math.ceil((audioBytes / 8000) * 1000) + 400 : 2500;
+        // Wait for Twilio to finish playing buffered audio: mulaw is 8000 bytes/sec.
+        // Floor at 1500ms to cover tiny utterances ("Connecting!") where the math
+        // would otherwise cut audio off mid-word.
+        const computed = audioBytes ? Math.ceil((audioBytes / 8000) * 1000) + 400 : 2500;
+        const audioMs  = Math.max(1500, computed);
         setTimeout(() => {
           const { onTransferSignal } = require('./transferHandler'); // lazy to avoid circular dep
           onTransferSignal(callSid);
         }, audioMs);
+      } else {
+        console.log('[haiku] Ignoring [TRANSFER] from state=' + current?.state);
       }
     }
 
@@ -97,21 +126,27 @@ async function onClientUtterance(callSid, transcript) {
   }
 }
 
-// ── Extract caller name + phone from conversation when AI omits the format ────
-// Fires a lightweight Claude call on the saved history — result stored async
+// ── Extract caller name + phone + taxType from conversation when AI omits ─────
+// Fires a lightweight Claude call on the saved history. Awaited by the transfer
+// flow so the agent briefing has correct details before the redirect happens.
 async function extractCallerInfo(callSid, history) {
   try {
     const extraction = await anthropic.messages.create({
       model:      'claude-haiku-4-5',
-      max_tokens: 60,
-      system:     'Extract the caller\'s first and last name and phone number from this conversation transcript. Reply ONLY with JSON like {"name":"John Smith","phone":"7145551234"}. Use null for any field not found.',
+      max_tokens: 80,
+      system:
+        'Extract the caller\'s first and last name, phone number, and tax type ' +
+        '(personal, business, or both) from this transcript. Reply ONLY with JSON ' +
+        'like {"name":"John Smith","phone":"7145551234","taxType":"personal"}. ' +
+        'Use null for any field not found.',
       messages:   history,
     });
     const raw = extraction.content[0].text.trim();
     const parsed = JSON.parse(raw.match(/\{.*\}/s)?.[0] || '{}');
     const updates = {};
-    if (parsed.name  && parsed.name  !== 'null') updates.callerName  = parsed.name;
-    if (parsed.phone && parsed.phone !== 'null') updates.callerPhone = parsed.phone;
+    if (parsed.name    && parsed.name    !== 'null') updates.callerName  = parsed.name;
+    if (parsed.phone   && parsed.phone   !== 'null') updates.callerPhone = parsed.phone;
+    if (parsed.taxType && parsed.taxType !== 'null') updates.taxType     = normalizeTaxType(parsed.taxType);
     if (Object.keys(updates).length) {
       store.updateCall(callSid, updates);
       console.log('[extract] Caller info:', updates);
@@ -119,6 +154,16 @@ async function extractCallerInfo(callSid, history) {
   } catch (err) {
     console.error('[extract] Failed to extract caller info:', err.message);
   }
+}
+
+// Map free-form tax-type strings to a canonical value used in briefings.
+function normalizeTaxType(raw) {
+  if (!raw) return null;
+  const s = String(raw).toLowerCase();
+  if (s.includes('both'))     return 'personal and business';
+  if (s.includes('business')) return 'business';
+  if (s.includes('personal')) return 'personal';
+  return s.trim();
 }
 
 // ── Speak text to client via ElevenLabs → WebSocket ──────────────────────────

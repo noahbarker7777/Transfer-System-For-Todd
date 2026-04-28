@@ -29,11 +29,13 @@ module.exports = {
   // ── ElevenLabs ───────────────────────────────────────────────────────────
   ELEVENLABS_API_KEY:  process.env.ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID: process.env.ELEVENLABS_VOICE_ID,
-  ELEVENLABS_MODEL:    process.env.ELEVENLABS_MODEL || 'eleven_turbo_v2',
+  // Must match the default in handlers/aiPipeline.js — flash_v2_5 has the
+  // lowest end-to-end latency for ulaw_8000 streaming, which the call needs.
+  ELEVENLABS_MODEL:    process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5',
 
   // ── Branding ─────────────────────────────────────────────────────────────
   COMPANY_NAME:    process.env.COMPANY_NAME    || 'Frazier Industries',
-  ASSISTANT_NAME:  process.env.ASSISTANT_NAME  || 'Aria',
+  ASSISTANT_NAME:  process.env.ASSISTANT_NAME  || 'Eryn',
 
   // ── CRM (optional) ───────────────────────────────────────────────────────
   HUBSPOT_API_KEY:  process.env.HUBSPOT_API_KEY  || '',
