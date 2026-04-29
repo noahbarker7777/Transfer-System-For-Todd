@@ -25,50 +25,51 @@ const xmlEscape = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').re
 // rendered silently in production for unclear reasons; alice is the safe pick.
 const VOICE = 'alice';
 
-// Build the briefing Todd hears. Returns an array of TwiML <Say>/<Pause> chunks
-// because the human-pickup case needs short sentences with breathing room — a
-// single long <Say> blew past Todd while he was still saying "hello".
-function briefingChunks({ callerName, callerPhone, taxType }, mode) {
+// Speak phone numbers digit-by-digit so TTS doesn't read "7145551234" as a year.
+function spellPhone(p) {
+  return String(p).replace(/\D/g, '').split('').join(' ');
+}
+
+// Compose the human-pickup briefing (paced for clarity, includes name + number).
+// Designed to be used as the prompt body inside <Gather>; ends with the explicit
+// "press 1 to accept" cue so Todd knows what action is required to bridge.
+function humanBriefingTwiml({ callerName, callerPhone, taxType }) {
+  const agent   = config.AGENT_NAME || 'Todd';
+  const name    = callerName  || 'a client';
+  const subject = taxType ? (taxType + ' taxes') : 'tax services';
+  const digits  = String(callerPhone || '').replace(/\D/g, '');
+  const numLine = digits.length >= 10
+    ? ' Their callback number is ' + spellPhone(digits) + '.'
+    : '';
+
+  return [
+    '<Pause length="1"/>',
+    '<Say voice="' + VOICE + '">Hi ' + xmlEscape(agent) + ', this is your assistant.</Say>',
+    '<Pause length="1"/>',
+    '<Say voice="' + VOICE + '">' + xmlEscape(name + ' is on the line about ' + subject + '.' + numLine) + '</Say>',
+    '<Pause length="1"/>',
+    '<Say voice="' + VOICE + '">Press one or say accept to take the call. Otherwise, hang up or stay silent.</Say>',
+  ].join('');
+}
+
+// Compose the voicemail briefing (no response required — speak then hang up).
+// Leading pause covers any tail of the greeting that AMD didn't fully wait out.
+function voicemailBriefingTwiml({ callerName, callerPhone, taxType }) {
   const agent   = config.AGENT_NAME || 'Todd';
   const company = config.COMPANY_NAME || 'Frazier Industries';
   const name    = callerName  || 'a client';
   const subject = taxType ? (taxType + ' taxes') : 'tax services';
+  const digits  = String(callerPhone || '').replace(/\D/g, '');
+  const numLine = digits.length >= 10
+    ? ' Their callback number is ' + spellPhone(digits) + '.'
+    : '';
 
-  if (mode === 'voicemail') {
-    const digits = String(callerPhone || '').replace(/\D/g, '');
-    const phone  = digits.length >= 10
-      ? ('. Their callback number is ' + spellPhone(digits))
-      : '';
-    return [
-      // Long pause first so any tail of the greeting/beep is past before we speak.
-      { kind: 'pause', length: 2 },
-      { kind: 'say',   text: 'Hi ' + agent + ', this is your ' + company + ' assistant.' },
-      { kind: 'say',   text: name + ' just called about ' + subject + phone + '.' },
-      { kind: 'say',   text: 'Please call them back as soon as you can. Goodbye.' },
-    ];
-  }
-  // Human bridge — pace the briefing so Todd hears it clearly even if he was
-  // still mid-"hello" when the audio path opened.
   return [
-    { kind: 'pause', length: 1 },
-    { kind: 'say',   text: 'Hi ' + agent + ', it\'s your assistant.' },
-    { kind: 'pause', length: 1 },
-    { kind: 'say',   text: name + ' is on the line about ' + subject + '.' },
-    { kind: 'pause', length: 1 },
-    { kind: 'say',   text: 'Connecting you now.' },
-  ];
-}
-
-function chunksToTwiml(chunks) {
-  return chunks.map(c => c.kind === 'pause'
-    ? '<Pause length="' + c.length + '"/>'
-    : '<Say voice="' + VOICE + '">' + xmlEscape(c.text) + '</Say>'
-  ).join('');
-}
-
-// Speak phone numbers digit-by-digit so Polly doesn't read "7145551234" as a year.
-function spellPhone(p) {
-  return String(p).replace(/\D/g, '').split('').join(' ');
+    '<Pause length="2"/>',
+    '<Say voice="' + VOICE + '">Hi ' + xmlEscape(agent) + ', this is your ' + xmlEscape(company) + ' assistant.</Say>',
+    '<Say voice="' + VOICE + '">' + xmlEscape(name + ' just called about ' + subject + '.' + numLine) + '</Say>',
+    '<Say voice="' + VOICE + '">Please call them back as soon as you can. Goodbye.</Say>',
+  ].join('');
 }
 
 // ── Move the client into the conference (alone, with hold music) ──────────────
@@ -121,19 +122,18 @@ router.all('/wait-music', (req, res) => {
 // AnsweredBy values: human, machine_start, machine_end_beep, machine_end_silence,
 // machine_end_other, fax, unknown.
 //
-// HUMAN BRANCH (the critical one):
-//   We do NOT inline <Say> + <Dial> in the same TwiML. Twilio is supposed to
-//   execute verbs in order, but in production the briefing was being skipped
-//   while the bridge still happened — Todd was dropped onto the call cold.
-//   The fix: wrap the briefing in <Gather>, which Twilio guarantees plays its
-//   prompt fully before moving on, then <Redirect> to a SEPARATE /agent-bridge
-//   endpoint that does only the conference dial. Even if a single <Say> ever
-//   fails silently, the bridge URL isn't fetched until the briefing TwiML has
-//   completed end-to-end. Todd cannot reach the bridge before the briefing.
+// HUMAN BRANCH:
+//   Gather plays the briefing in full (Twilio guarantees the prompt completes
+//   before moving on), then waits up to 10 seconds for Todd to RESPOND — either
+//   press 1 / press any digit, or say "accept"/"yes"/"ok". Action URL is
+//   /agent-decision, which decides bridge-vs-fallback based on what Todd did.
+//   The bridge URL is only ever returned by /agent-decision when Todd actually
+//   responds — there is no code path where the conference dial executes
+//   without an explicit acceptance.
 //
 // VOICEMAIL BRANCH:
-//   Long leading <Pause> to step over the start of the greeting tail, then
-//   speak the message and hang up.
+//   AnsweredBy=machine_* / fax / unknown → leave the briefing as a voicemail
+//   then hang up. Status callback fires fallback for the client afterward.
 router.post('/agent-pickup', (req, res) => {
   const conf          = req.query.conf;
   const clientCallSid = req.query.clientCallSid;
@@ -152,60 +152,85 @@ router.post('/agent-pickup', (req, res) => {
     taxType:     call?.taxType,
   };
 
-  // Voicemail branch — anything starting with "machine", plus 'fax' and 'unknown'.
+  // Voicemail: anything that isn't clearly a human answers here.
   const isMachine = answeredBy.startsWith('machine') ||
                     answeredBy === 'fax' ||
                     answeredBy === 'unknown';
 
   if (isMachine) {
-    const body = chunksToTwiml(briefingChunks(briefingPayload, 'voicemail'));
     console.log('[agent-pickup V4] machine detected → leaving voicemail');
     return res.type('text/xml').send(
       '<?xml version="1.0" encoding="UTF-8"?>' +
-      '<Response>' + body + '<Hangup/></Response>'
+      '<Response>' + voicemailBriefingTwiml(briefingPayload) + '<Hangup/></Response>'
     );
   }
 
-  // Human pickup — Gather forces briefing to play in full before /agent-bridge
-  // is fetched. Both paths (Todd presses any digit, or Gather times out) lead
-  // to the same /agent-bridge endpoint; bridge happens AFTER the briefing.
-  const bridgeUrl = process.env.SERVER_URL + '/call/agent-bridge?' +
-                    new URLSearchParams({ conf, clientCallSid }).toString();
-  const briefing  = chunksToTwiml(briefingChunks(briefingPayload, 'human'));
+  // Human pickup — brief Todd, then wait for him to accept before bridging.
+  const decisionUrl = process.env.SERVER_URL + '/call/agent-decision?' +
+                      new URLSearchParams({ conf, clientCallSid }).toString();
 
-  console.log('[agent-pickup V4] human → briefing fence then /agent-bridge');
+  console.log('[agent-pickup V4] human → briefing then awaiting accept');
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-      '<Gather numDigits="1" timeout="3" finishOnKey="" ' +
-              'action="' + bridgeUrl + '" method="POST">' +
-        briefing +
+      '<Gather input="speech dtmf" numDigits="1" speechTimeout="auto" ' +
+              'timeout="10" finishOnKey="" ' +
+              'action="' + decisionUrl + '" method="POST">' +
+        humanBriefingTwiml(briefingPayload) +
       '</Gather>' +
-      // If Gather times out without a key press, redirect to bridge anyway.
-      '<Redirect method="POST">' + bridgeUrl + '</Redirect>' +
+      // Belt-and-suspenders: if Gather returns without firing the action URL
+      // (e.g. transient Twilio issue), redirect to the same decision endpoint
+      // so the no-response path still triggers fallback rather than hanging.
+      '<Redirect method="POST">' + decisionUrl + '</Redirect>' +
     '</Response>'
   );
 });
 
-// ── Bridge endpoint — only reached after /agent-pickup's Gather completes ─────
-// Sole responsibility: drop Todd's call leg into the conference. By the time
-// Twilio fetches this URL, the briefing has fully played.
-router.all('/agent-bridge', (req, res) => {
-  const conf          = req.query.conf || req.body.conf;
-  const clientCallSid = req.query.clientCallSid || req.body.clientCallSid;
-  console.log('[agent-bridge V4] client=' + clientCallSid + ' conf=' + conf +
-              ' digits=' + (req.body.Digits || ''));
+// ── Decision endpoint — Todd's response decides bridge vs fallback ────────────
+// Fired by Gather's action URL with either Digits (press) or SpeechResult (voice).
+//   accepted ('1' or "accept"/"yes"/"ok"/etc.) → return <Dial><Conference>
+//   anything else / no input                   → say goodbye + <Hangup/>; the
+//                                                agent-call status callback
+//                                                will then trigger client fallback.
+router.post('/agent-decision', (req, res) => {
+  const conf          = req.query.conf;
+  const clientCallSid = req.query.clientCallSid;
+  const digits        = (req.body.Digits || '').trim();
+  const speech        = (req.body.SpeechResult || '').toLowerCase().trim();
+
+  const accepted = digits === '1' ||
+                   /\b(accept|accepted|yes|yeah|yep|yup|ok|okay|sure|connect|connected)\b/.test(speech);
+
+  console.log('[agent-decision V4] client=' + clientCallSid +
+              ' digits="' + digits + '"' +
+              ' speech="' + speech + '"' +
+              ' accepted=' + accepted);
+
+  if (accepted) {
+    return res.type('text/xml').send(
+      '<?xml version="1.0" encoding="UTF-8"?>' +
+      '<Response>' +
+        '<Say voice="' + VOICE + '">Connecting you now.</Say>' +
+        '<Dial>' +
+          '<Conference ' +
+            'startConferenceOnEnter="true" ' +
+            'endConferenceOnExit="true" ' +
+            'beep="false">' +
+            xmlEscape(conf) +
+          '</Conference>' +
+        '</Dial>' +
+      '</Response>'
+    );
+  }
+
+  // Declined or no response — hang up Todd's leg politely. The /call/status/agent
+  // completed callback will see agentJoinedConference=false and trigger the
+  // client fallback (Eryn will deliver the "Todd was unavailable" script).
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-      '<Dial>' +
-        '<Conference ' +
-          'startConferenceOnEnter="true" ' +
-          'endConferenceOnExit="true" ' +
-          'beep="false">' +
-          xmlEscape(conf) +
-        '</Conference>' +
-      '</Dial>' +
+      '<Say voice="' + VOICE + '">Okay, I will let them know. Goodbye.</Say>' +
+      '<Hangup/>' +
     '</Response>'
   );
 });
