@@ -44,7 +44,7 @@ async function onClientUtterance(callSid, transcript) {
   // Build the messages array WITHOUT mutating saved history yet — if the API
   // call throws, we don't want a dangling user turn that desyncs Anthropic's
   // strict alternation requirement on the next call.
-  const baseHistory = store.getConversation(callSid).filter(m => m.content !== '__init__');
+  const baseHistory = store.getConversation(callSid);
   const history     = [...baseHistory, { role: 'user', content: userMessage }];
 
   try {
@@ -64,6 +64,12 @@ async function onClientUtterance(callSid, transcript) {
     const transferMatch = aiText.match(/\[TRANSFER((?:\|[^\]]+)*)\]/);
     if (transferMatch) {
       shouldTransfer = true;
+      // Lock state IMMEDIATELY so any background-noise transcript that arrives
+      // during the upcoming awaits (extractCallerInfo + speakToClient) can't
+      // kick off a parallel AI turn. The early state check at the top of this
+      // function will reject those.
+      store.updateCall(callSid, { state: 'TRANSFERRING' });
+
       const fields = {};
       (transferMatch[1] || '')
         .split('|')
@@ -75,6 +81,7 @@ async function onClientUtterance(callSid, transcript) {
         });
 
       const updates = {};
+      // Keys are lowercased on parse (line ~73), so token "taxType" → "taxtype".
       if (fields.name)    updates.callerName  = fields.name;
       if (fields.phone)   updates.callerPhone = fields.phone;
       if (fields.taxtype) updates.taxType     = normalizeTaxType(fields.taxtype);
@@ -86,7 +93,7 @@ async function onClientUtterance(callSid, transcript) {
       // If the model omitted name/phone/taxType, mine them from the conversation
       // history BEFORE the briefing fires, so Todd hears the right details.
       const current = store.getCall(callSid);
-      if (!current.callerName || !current.callerPhone || !current.taxType) {
+      if (current && (!current.callerName || !current.callerPhone || !current.taxType)) {
         await extractCallerInfo(callSid, history);
       }
     }
@@ -99,14 +106,11 @@ async function onClientUtterance(callSid, transcript) {
     const audioBytes = await speakToClient(callSid, aiText);
 
     if (shouldTransfer) {
-      // Only honor [TRANSFER] tokens emitted during qualification. If the model
-      // hallucinates a token during FALLBACK or after we've already locked the
-      // state to TRANSFERRING, ignoring it keeps the call from getting wedged.
+      // State was already locked to TRANSFERRING when [TRANSFER] was parsed
+      // (see above). Just verify the call still exists and schedule the dial
+      // after the audio buffer drains.
       const current = store.getCall(callSid);
-      if (current && current.state === 'QUALIFYING') {
-        // Lock state immediately so any background-noise transcript can't kick
-        // off a new AI turn during the audio-flush delay.
-        store.updateCall(callSid, { state: 'TRANSFERRING' });
+      if (current && current.state === 'TRANSFERRING') {
         // Wait for Twilio to finish playing buffered audio: mulaw is 8000 bytes/sec.
         // Floor at 1500ms to cover tiny utterances ("Connecting!") where the math
         // would otherwise cut audio off mid-word.
@@ -117,7 +121,7 @@ async function onClientUtterance(callSid, transcript) {
           onTransferSignal(callSid);
         }, audioMs);
       } else {
-        console.log('[haiku] Ignoring [TRANSFER] from state=' + current?.state);
+        console.log('[haiku] Skipping transfer dial — state=' + current?.state);
       }
     }
 

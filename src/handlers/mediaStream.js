@@ -36,6 +36,14 @@ function handleMediaStream(ws, req) {
         }
 
         const streamSid = msg.start.streamSid;
+        // Guard against a missing call record so updateCall doesn't create a
+        // ghost entry from an empty object (store.updateCall does {...existing}
+        // which materializes a record even when nothing was there).
+        if (!getCall(callSid)) {
+          console.error('[media] No call record for ' + callSid + ' at start — closing WS');
+          ws.close();
+          return;
+        }
         // Update the media connection — this also handles reconnection after
         // a voicemail fallback where a new WebSocket opens for the same callSid
         updateCall(callSid, { streamSid });
@@ -58,7 +66,13 @@ function handleMediaStream(ws, req) {
         dgConnection.on(LiveTranscriptionEvents.Open, () => {
           console.log('[Deepgram] Session open for ' + callSid);
           const call = getCall(callSid);
-          if (!call) return;
+          if (!call) {
+            // Should not happen — /call/inbound runs setCall before Twilio
+            // opens the WS — but log loudly if it ever does so we know to
+            // investigate rather than silently dropping the greeting.
+            console.error('[media] No call record for ' + callSid + ' at Deepgram open — skipping greeting');
+            return;
+          }
 
           if (call.state === 'GREETING') {
             // First connection — fire the opening greeting

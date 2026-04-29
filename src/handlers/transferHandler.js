@@ -50,11 +50,14 @@ async function onTransferSignal(clientCallSid) {
 
   const conferenceName = 'conf-' + clientCallSid;
 
+  // Note: deliberately do NOT reset agentCallSid here. transferStarted gates
+  // re-entry, so leaving any prior value alone is safe and avoids a brief
+  // null-window where the client-completed webhook would skip cancelling
+  // Todd's leg if the client hangs up between this write and line ~95.
   store.updateCall(clientCallSid, {
     state: 'TRANSFERRING',
     transferStarted: true,
     conferenceName,
-    agentCallSid: null,
     agentJoinedConference: false,
     agentAnsweredBy: null,
     fallbackTriggered: false,
@@ -83,6 +86,7 @@ async function onTransferSignal(clientCallSid) {
     await twilio.redirectCall(clientCallSid, moveUrl);
   } catch (err) {
     console.error('[Transfer ' + BUILD_TAG + '] Failed to move client to conference:', err.message);
+    await triggerClientFallback(clientCallSid, 'redirect-failed');
     return;
   }
 

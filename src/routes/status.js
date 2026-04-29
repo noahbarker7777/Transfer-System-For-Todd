@@ -80,12 +80,14 @@ router.post('/agent', async (req, res) => {
 
   // Primary signal: conference participant-join wrote agentJoinedConference.
   // Backstop for webhook reordering: a human-answered call that lasted longer
-  // than the briefing (~5s) almost certainly reached the bridge — even if the
-  // conference webhook hasn't landed yet.
+  // than the briefing + Gather window (~25s) almost certainly reached the
+  // bridge — even if the conference webhook hasn't landed yet. The lower
+  // threshold of 8s previously misclassified Todd-declined calls (briefing ~7s
+  // + Gather timeout 10s) as bridged.
   const durationSec = parseInt(CallDuration || '0', 10);
   const ab          = (updatedCall.agentAnsweredBy || AnsweredBy || '').toLowerCase();
   const probablyBridged = updatedCall.agentJoinedConference ||
-                          (ab === 'human' && durationSec > 8);
+                          (ab === 'human' && durationSec > 25);
 
   if (probablyBridged) {
     console.log('[Status/Agent] Todd bridged & ended cleanly (duration=' + durationSec + 's)');

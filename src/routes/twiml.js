@@ -87,12 +87,17 @@ router.all('/move-client', (req, res) => {
 
   console.log('[move-client V4] callSid=' + clientCallSid + ' conf=' + conf);
 
+  // Cap the conference Dial at 60s so a stuck/stalled flow doesn't leave the
+  // caller on hold music indefinitely. AMD timeout (30s) + ring (15s) +
+  // briefing/Gather (~17s) ≈ 60s worst-case. If we hit the cap, status.js
+  // will see no participant-join and trigger fallback via the agent
+  // completed callback.
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
       '<Say voice="' + VOICE + '">Please hold for just a moment while I bring ' +
         xmlEscape(agent) + ' on the line.</Say>' +
-      '<Dial>' +
+      '<Dial timeout="60">' +
         '<Conference ' +
           'startConferenceOnEnter="false" ' +
           'endConferenceOnExit="true" ' +    // client hangup ends conference
