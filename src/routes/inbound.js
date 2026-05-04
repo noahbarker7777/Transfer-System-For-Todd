@@ -9,16 +9,31 @@ function handleInbound(req, res) {
   const callerNumber = direction.startsWith('outbound')
     ? (req.body.To   || 'unknown')
     : (req.body.From || 'unknown');
+
+  // Outbound calls pass caller name/phone as query params (set by /call/outbound).
+  const qName  = req.query.caller_name  || '';
+  const qPhone = req.query.caller_phone || '';
+
   const wsUrl = process.env.SERVER_URL.replace(/^https/, 'wss') + '/media-stream';
 
-  console.log('[inbound] New call ' + callSid + ' (' + direction + ') from ' + callerNumber);
+  console.log('[inbound] New call ' + callSid + ' (' + direction + ') from ' + callerNumber +
+              (qName  ? ' name="' + qName  + '"' : '') +
+              (qPhone ? ' qphone="' + qPhone + '"' : ''));
 
   setCall(callSid, {
     state: 'GREETING',
     callerNumber,
-    callerPhone: callerNumber, // default; AI may override with confirmed number
-    callerName: null,
-    taxType: null,
+    callerPhone: qPhone || callerNumber,  // CRM-supplied if available
+    callerName:  qName  || null,
+
+    // ── Booking-flow state (ERYN_BOOKING_V1) ──────────────────────────────
+    qualifyingAnswer:    null,    // 'yes' | 'no'
+    offeredSlots:        null,    // [{start_iso,end_iso,label}]
+    bookingAttempts:     0,
+    bookedAppointmentId: null,
+    bookedStartISO:      null,
+    bookedStartPretty:   null,
+    pendingTool:         null,    // 'scan' | 'book' | null — blocks AI while a webhook is in flight
 
     // ── Transfer-flow state (TRANSFER_V4) ─────────────────────────────────
     transferStarted: false,

@@ -1,15 +1,20 @@
 'use strict';
 
 /**
- * routes/status.js — TRANSFER_V4
+ * routes/status.js — ERYN_BOOKING_V1 (over TRANSFER_V4 plumbing)
  *
  * Mounted at /call/status.
  *
  * Sub-routes:
  *   POST /             — root client call lifecycle (cleanup on completed)
- *   POST /agent        — Todd's outbound call lifecycle (decides fallback)
+ *   POST /agent        — Todd's outbound call lifecycle (decides success/fail)
  *   POST /conference   — conference participant events (drives agentJoinedConference)
  *   POST /recording    — recording callbacks (kept for future use)
+ *
+ * Outcome routing per spec:
+ *   - Todd bridges        → WH5 (cancel appt + SMS Todd "appt canceled, you're on the line")
+ *   - Todd never bridges  → WH6 (keep appt + SMS Todd "missed call, appt still booked")
+ *                            then HANG UP both legs — no callback to client.
  */
 
 const express = require('express');
@@ -17,7 +22,17 @@ const router  = express.Router();
 const store   = require('../store');
 const twilio  = require('../twilioClient');
 const logging = require('../handlers/logging');
-const { triggerClientFallback } = require('../handlers/transferHandler');
+const ghl     = require('../handlers/ghlWebhooks');
+
+// Track which Todd-outcome webhook we've already fired per call to keep them
+// idempotent across retried Twilio status callbacks.
+const outcomeFired = new Map();   // clientCallSid → 'success' | 'failed'
+
+function markFired(callSid, kind) {
+  if (outcomeFired.get(callSid)) return false;
+  outcomeFired.set(callSid, kind);
+  return true;
+}
 
 // ── Root client call lifecycle ────────────────────────────────────────────────
 router.post('/', async (req, res) => {
@@ -39,6 +54,7 @@ router.post('/', async (req, res) => {
   }
 
   await logging.logOutcome(CallSid, call.state, CallDuration);
+  outcomeFired.delete(CallSid);
   store.deleteCall(CallSid);
 });
 
@@ -73,57 +89,50 @@ router.post('/agent', async (req, res) => {
 
   if (CallStatus !== 'completed') return;
 
-  // Only act on completed. If Todd successfully bridged, the conference
-  // status callback will have set agentJoinedConference = true.
   const updatedCall = store.getCall(clientCallSid);
   if (!updatedCall) return;
 
-  // Primary signal: conference participant-join wrote agentJoinedConference.
-  // Backstop for webhook reordering: a human-answered call that lasted longer
-  // than the briefing + Gather window (~25s) almost certainly reached the
-  // bridge — even if the conference webhook hasn't landed yet. The lower
-  // threshold of 8s previously misclassified Todd-declined calls (briefing ~7s
-  // + Gather timeout 10s) as bridged.
+  // Same backstop as before: long-duration human-answered calls almost
+  // certainly bridged even if the conference webhook hasn't landed.
   const durationSec = parseInt(CallDuration || '0', 10);
   const ab          = (updatedCall.agentAnsweredBy || AnsweredBy || '').toLowerCase();
   const probablyBridged = updatedCall.agentJoinedConference ||
                           (ab === 'human' && durationSec > 25);
 
   if (probablyBridged) {
-    console.log('[Status/Agent] Todd bridged & ended cleanly (duration=' + durationSec + 's)');
+    console.log('[Status/Agent] Todd bridged (duration=' + durationSec + 's)');
+    if (markFired(clientCallSid, 'success')) {
+      ghl.fireToddSuccess({
+        callSid:        clientCallSid,
+        callerName:     updatedCall.callerName,
+        callerPhone:    updatedCall.callerPhone,
+        appointmentId:  updatedCall.bookedAppointmentId,
+        startPretty:    updatedCall.bookedStartPretty,
+      });
+    }
     store.updateCall(clientCallSid, { state: 'DONE' });
     return;
   }
 
-  // Todd didn't bridge. Decide why so we can SMS Todd the right context and
-  // tell the client what happened (Eryn's __fallback__ script handles wording).
-  // Mirror the bridge-vs-voicemail decision from /agent-pickup: 'unknown' is
-  // treated as voicemail there, so we tag it the same way here for consistent
-  // CRM logging and SMS wording.
-  let reason;
-  if (ab.startsWith('machine') || ab === 'fax' || ab === 'unknown') {
-    reason = 'voicemail';
-  } else if (CallStatus === 'no-answer' || CallStatus === 'busy' || CallStatus === 'failed') {
-    reason = 'no-answer';
-  } else {
-    reason = 'abandoned';   // human answered but never reached the bridge
+  // Todd did not bridge — voicemail / no-answer / abandoned briefing.
+  console.log('[Status/Agent] Todd did NOT bridge — firing WH6 + hanging up client');
+
+  if (markFired(clientCallSid, 'failed')) {
+    ghl.fireToddFailed({
+      callSid:        clientCallSid,
+      callerName:     updatedCall.callerName,
+      callerPhone:    updatedCall.callerPhone,
+      appointmentId:  updatedCall.bookedAppointmentId,
+      startPretty:    updatedCall.bookedStartPretty,
+    });
   }
 
-  // Backup SMS noting the missed transfer outcome.
-  twilio.smsBriefing({
-    callerName:  updatedCall.callerName,
-    callerPhone: updatedCall.callerPhone,
-    taxType:     updatedCall.taxType,
-    context:     reason === 'voicemail' ? 'voicemail' : 'no-answer',
-  }).catch(err => console.error('[Status/Agent] SMS error:', err.message));
-
-  await triggerClientFallback(clientCallSid, reason);
+  // Per spec: do NOT call the client back to AI. Hang up both legs.
+  store.updateCall(clientCallSid, { state: 'DONE' });
+  await twilio.hangupCall(clientCallSid);
 });
 
 // ── Conference participant events ─────────────────────────────────────────────
-// We watch for participant-join with CallSid === stored agentCallSid; that
-// is the single source of truth for "Todd actually bridged". The agent call's
-// completed callback reads the resulting flag.
 router.post('/conference', (req, res) => {
   res.sendStatus(200);
 
@@ -142,14 +151,21 @@ router.post('/conference', (req, res) => {
   if (!call.agentCallSid) return;
 
   if (eventCallSid === call.agentCallSid) {
-    // Always set agentJoinedConference (single source of truth for bridge happened).
-    // But don't downgrade FALLBACK/DONE state — handles webhook reordering where
-    // the agent's completed callback raced ahead of this participant-join event.
-    const stateUpdate = ['FALLBACK', 'DONE'].includes(call.state)
-      ? {}
-      : { state: 'CONNECTED' };
+    const stateUpdate = ['DONE'].includes(call.state) ? {} : { state: 'CONNECTED' };
     store.updateCall(clientCallSid, { agentJoinedConference: true, ...stateUpdate });
     console.log('[Status/Conference] Todd joined → bridge live');
+
+    // Fire WH5 the moment we know Todd is on the line. Idempotent so the
+    // /agent completed callback won't double-fire it.
+    if (markFired(clientCallSid, 'success')) {
+      ghl.fireToddSuccess({
+        callSid:        clientCallSid,
+        callerName:     call.callerName,
+        callerPhone:    call.callerPhone,
+        appointmentId:  call.bookedAppointmentId,
+        startPretty:    call.bookedStartPretty,
+      });
+    }
   }
 });
 

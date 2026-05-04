@@ -41,4 +41,16 @@ module.exports = {
   HUBSPOT_API_KEY:  process.env.HUBSPOT_API_KEY  || '',
   AIRTABLE_API_KEY: process.env.AIRTABLE_API_KEY || '',
   AIRTABLE_BASE_ID: process.env.AIRTABLE_BASE_ID || '',
+
+  // ── n8n booking-flow webhooks (ERYN_BOOKING_V1) ─────────────────────────
+  // Each is the full POST URL of the matching n8n workflow's Webhook trigger.
+  N8N_QUALIFYING_URL:   process.env.N8N_QUALIFYING_URL   || '',
+  N8N_SCAN_URL:         process.env.N8N_SCAN_URL         || '',
+  N8N_BOOK_URL:         process.env.N8N_BOOK_URL         || '',
+  N8N_APPT_DETAILS_URL: process.env.N8N_APPT_DETAILS_URL || '',
+  N8N_TODD_SUCCESS_URL: process.env.N8N_TODD_SUCCESS_URL || '',
+  N8N_TODD_FAILED_URL:  process.env.N8N_TODD_FAILED_URL  || '',
+
+  // Default timezone for natural-language slot labels and Google Cal queries.
+  DEFAULT_TIMEZONE: process.env.DEFAULT_TIMEZONE || 'America/Los_Angeles',
 };

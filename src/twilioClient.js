@@ -35,7 +35,7 @@ async function dialAgentWithAMD({ clientCallSid, conferenceName }) {
       from:   config.TWILIO_PHONE_NUMBER,
       url:    pickupUrl,
       method: 'POST',
-      timeout: 15,                              // ring time before no-answer
+      timeout: 20,                              // ring time before no-answer (per spec)
       // 'DetectMessageEnd' waits for the voicemail beep before invoking pickupUrl
       // so our voicemail message lands AFTER the beep (correctly recorded).
       // For human pickup the AMD wait adds 2-4s of silence before the briefing

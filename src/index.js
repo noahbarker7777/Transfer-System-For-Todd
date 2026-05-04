@@ -6,6 +6,7 @@ const WebSocket = require('ws');
 const { handleInbound }     = require('./routes/inbound');
 const twimlRoutes           = require('./routes/twiml');
 const statusRoutes          = require('./routes/status');
+const outboundRoutes        = require('./routes/outbound');
 const { handleMediaStream } = require('./handlers/mediaStream');
 
 const app = express();
@@ -13,12 +14,13 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ ok: true, build: 'TRANSFER_V4' }));
+app.get('/health', (req, res) => res.json({ ok: true, build: 'ERYN_BOOKING_V1' }));
 
 // ── Twilio webhook routes ─────────────────────────────────────────────────────
 app.post('/call/inbound', handleInbound);
-app.use('/call/status', statusRoutes);
-app.use('/call',        twimlRoutes);
+app.use('/call/status',   statusRoutes);
+app.use('/call/outbound', outboundRoutes);
+app.use('/call',          twimlRoutes);
 
 // ── HTTP + WebSocket server ───────────────────────────────────────────────────
 const server = createServer(app);
@@ -31,6 +33,6 @@ wss.on('connection', (ws, req) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log('[server] TRANSFER_V4 running on port ' + PORT);
+  console.log('[server] ERYN_BOOKING_V1 running on port ' + PORT);
   console.log('[server] Public URL: ' + process.env.SERVER_URL);
 });

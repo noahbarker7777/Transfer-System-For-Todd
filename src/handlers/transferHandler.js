@@ -26,6 +26,7 @@
 const store  = require('../store');
 const twilio = require('../twilioClient');
 const config = require('../config');
+const ghl    = require('./ghlWebhooks');
 
 const BUILD_TAG = 'TRANSFER_V4';
 
@@ -65,16 +66,10 @@ async function onTransferSignal(clientCallSid) {
 
   console.log('[Transfer ' + BUILD_TAG + '] Beginning transfer for ' + clientCallSid +
               ' name="' + (call.callerName || '') + '"' +
-              ' phone="' + (call.callerPhone || '') + '"' +
-              ' taxType="' + (call.taxType || '') + '"');
+              ' phone="' + (call.callerPhone || '') + '"');
 
-  // 1. SMS Todd — fire-and-forget so it never blocks the call flow.
-  twilio.smsBriefing({
-    callerName:  call.callerName,
-    callerPhone: call.callerPhone,
-    taxType:     call.taxType,
-    context:     'pre-transfer',
-  }).catch(err => console.error('[Transfer ' + BUILD_TAG + '] SMS error:', err.message));
+  // No pre-transfer SMS here — WH4 (appt details) already notified Todd if a
+  // booking was made. WH5/WH6 fire from status.js based on bridge outcome.
 
   // 2. Move the client into the conference (alone, hold music).
   const moveUrl = config.SERVER_URL + '/call/move-client?' + new URLSearchParams({
@@ -86,7 +81,7 @@ async function onTransferSignal(clientCallSid) {
     await twilio.redirectCall(clientCallSid, moveUrl);
   } catch (err) {
     console.error('[Transfer ' + BUILD_TAG + '] Failed to move client to conference:', err.message);
-    await triggerClientFallback(clientCallSid, 'redirect-failed');
+    await abortTransfer(clientCallSid, 'redirect-failed');
     return;
   }
 
@@ -99,9 +94,28 @@ async function onTransferSignal(clientCallSid) {
     store.updateCall(clientCallSid, { agentCallSid: agentSid });
   } catch (err) {
     console.error('[Transfer ' + BUILD_TAG + '] Dial-Todd failed:', err.message);
-    // Hard fail at the dial step — pull the client back to AI immediately.
-    await triggerClientFallback(clientCallSid, 'dial-failed');
+    await abortTransfer(clientCallSid, 'dial-failed');
   }
+}
+
+// ── Abort transfer when the setup itself errors before Todd was even dialed ──
+// Per spec: do NOT bring the client back to the AI. Fire WH6 (so Todd sees a
+// missed-call message and the appt stays booked) then hang up the client.
+async function abortTransfer(clientCallSid, reason) {
+  const call = store.getCall(clientCallSid);
+  if (!call) return;
+  console.log('[Transfer ' + BUILD_TAG + '] Aborting (' + reason + ') for ' + clientCallSid);
+
+  ghl.fireToddFailed({
+    callSid:        clientCallSid,
+    callerName:     call.callerName,
+    callerPhone:    call.callerPhone,
+    appointmentId:  call.bookedAppointmentId,
+    startPretty:    call.bookedStartPretty,
+  });
+
+  store.updateCall(clientCallSid, { state: 'DONE' });
+  await twilio.hangupCall(clientCallSid);
 }
 
 // ── Fallback: redirect client out of conference and back into MediaStream ─────
@@ -131,4 +145,5 @@ async function triggerClientFallback(clientCallSid, reason) {
 module.exports = {
   onTransferSignal,
   triggerClientFallback,
+  abortTransfer,
 };
