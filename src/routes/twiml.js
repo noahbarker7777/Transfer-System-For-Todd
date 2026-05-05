@@ -123,73 +123,45 @@ router.all('/wait-music', (req, res) => {
 });
 
 // ── Twilio invokes this once Todd's call is answered (and AMD has finished) ───
-// AnsweredBy values: human, machine_start, machine_end_beep, machine_end_silence,
-// machine_end_other, fax, unknown.
+// AnsweredBy values: human, machine_start, machine_end_*, fax, unknown.
 //
-// HUMAN BRANCH:
-//   Gather plays the briefing in full (Twilio guarantees the prompt completes
-//   before moving on), then waits up to 10 seconds for Todd to RESPOND — either
-//   press 1 / press any digit, or say "accept"/"yes"/"ok". Action URL is
-//   /agent-decision, which decides bridge-vs-fallback based on what Todd did.
-//   The bridge URL is only ever returned by /agent-decision when Todd actually
-//   responds — there is no code path where the conference dial executes
-//   without an explicit acceptance.
-//
-// VOICEMAIL BRANCH:
-//   AnsweredBy=machine_* / fax / unknown → leave the briefing as a voicemail
-//   then hang up. Status callback fires fallback for the client afterward.
+// New rule (per spec): ZERO briefing, ZERO press-1-to-accept. Todd picks up,
+// he is bridged to the client immediately — that's it.
+//   - Human pickup → return <Dial><Conference> right away → bridged.
+//   - Machine / voicemail / unknown / fax → <Hangup/> the agent leg silently.
+//     Status callback then fires WH6 (Todd missed call) and the client leg
+//     hangs up too.
 router.post('/agent-pickup', (req, res) => {
   const conf          = req.query.conf;
   const clientCallSid = req.query.clientCallSid;
   const answeredBy    = (req.body.AnsweredBy || '').toLowerCase();
   const call          = clientCallSid ? store.getCall(clientCallSid) : null;
 
-  console.log('[agent-pickup V4] client=' + clientCallSid +
-              ' answeredBy=' + answeredBy +
-              ' fullBody=' + JSON.stringify(req.body));
+  console.log('[agent-pickup] client=' + clientCallSid +
+              ' answeredBy=' + answeredBy);
 
   if (call) store.updateCall(clientCallSid, { agentAnsweredBy: answeredBy || 'unknown' });
 
-  const briefingPayload = {
-    callerName:  call?.callerName,
-    callerPhone: call?.callerPhone,
-    taxType:     call?.taxType,
-  };
-
-  // Voicemail: anything that isn't clearly a human answers here.
   const isMachine = answeredBy.startsWith('machine') ||
                     answeredBy === 'fax' ||
                     answeredBy === 'unknown';
 
   if (isMachine) {
-    console.log('[agent-pickup V4] machine detected → leaving voicemail');
+    console.log('[agent-pickup] machine detected → hanging up Todd silently');
     return res.type('text/xml').send(
-      '<?xml version="1.0" encoding="UTF-8"?>' +
-      '<Response>' + voicemailBriefingTwiml(briefingPayload) + '<Hangup/></Response>'
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
     );
   }
 
-  // Human pickup — brief Todd, then wait for him to accept before bridging.
-  const decisionUrl = process.env.SERVER_URL + '/call/agent-decision?' +
-                      new URLSearchParams({ conf, clientCallSid }).toString();
-  // CRITICAL: the URL contains '&' between query params. Embedding it raw in
-  // XML attributes / text breaks the TwiML parser and Twilio plays its
-  // "I'm sorry, an application error has occurred" prompt and hangs up.
-  const decisionUrlXml = xmlEscape(decisionUrl);
-
-  console.log('[agent-pickup V4] human → briefing then awaiting accept');
+  console.log('[agent-pickup] human → bridging Todd to conference immediately');
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
-      '<Gather input="speech dtmf" numDigits="1" speechTimeout="auto" ' +
-              'timeout="10" finishOnKey="" ' +
-              'action="' + decisionUrlXml + '" method="POST">' +
-        humanBriefingTwiml(briefingPayload) +
-      '</Gather>' +
-      // Belt-and-suspenders: if Gather returns without firing the action URL
-      // (e.g. transient Twilio issue), redirect to the same decision endpoint
-      // so the no-response path still triggers fallback rather than hanging.
-      '<Redirect method="POST">' + decisionUrlXml + '</Redirect>' +
+      '<Dial>' +
+        '<Conference startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">' +
+          xmlEscape(conf) +
+        '</Conference>' +
+      '</Dial>' +
     '</Response>'
   );
 });
