@@ -67,19 +67,16 @@ function handleMediaStream(ws, req) {
           console.log('[Deepgram] Session open for ' + callSid);
           const call = getCall(callSid);
           if (!call) {
-            // Should not happen — /call/inbound runs setCall before Twilio
-            // opens the WS — but log loudly if it ever does so we know to
-            // investigate rather than silently dropping the greeting.
-            console.error('[media] No call record for ' + callSid + ' at Deepgram open — skipping greeting');
+            console.error('[media] No call record for ' + callSid + ' at Deepgram open');
             return;
           }
 
-          if (call.state === 'GREETING') {
-            // First connection — fire the opening greeting
-            updateCall(callSid, { state: 'QUALIFYING' });
-            onClientUtterance(callSid, '__greeting__');
-          } else if (call.pendingFallback) {
-            // Reconnection after a failed transfer — AI delivers fallback script
+          // We deliberately do NOT speak on Deepgram open. Eryn must wait for
+          // the caller to speak first (typically "hello?"). The first
+          // speech_final / UtteranceEnd in the GREETING state fires the
+          // opening line below.
+          if (call.pendingFallback) {
+            // Reconnection after a failed transfer — AI delivers fallback script.
             updateCall(callSid, { pendingFallback: false, state: 'FALLBACK' });
             onClientUtterance(callSid, '__fallback__');
           }
@@ -106,14 +103,21 @@ function handleMediaStream(ws, req) {
           }
 
           if (data.speech_final) {
-            // If speech_final arrived without is_final on this packet, the new
-            // chunk hasn't been folded in yet — append it now to avoid losing it.
             const full = data.is_final
               ? pendingTranscript
               : (pendingTranscript ? pendingTranscript + ' ' + transcript : transcript);
             pendingTranscript = '';
             stopCurrentAudio(callSid);
-            onClientUtterance(callSid, full);
+            // First utterance triggers Eryn's opening line — we ignore what
+            // the caller actually said (typically "hello?") and just kick
+            // off the scripted greeting.
+            const cur = getCall(callSid);
+            if (cur && cur.state === 'GREETING') {
+              updateCall(callSid, { state: 'QUALIFYING' });
+              onClientUtterance(callSid, '__greeting__');
+            } else {
+              onClientUtterance(callSid, full);
+            }
           }
         });
 
@@ -125,7 +129,13 @@ function handleMediaStream(ws, req) {
             pendingTranscript = '';
             console.log('[Deepgram] UtteranceEnd → processing: "' + full + '"');
             stopCurrentAudio(callSid);
-            onClientUtterance(callSid, full);
+            const cur = getCall(callSid);
+            if (cur && cur.state === 'GREETING') {
+              updateCall(callSid, { state: 'QUALIFYING' });
+              onClientUtterance(callSid, '__greeting__');
+            } else {
+              onClientUtterance(callSid, full);
+            }
           }
         });
 
