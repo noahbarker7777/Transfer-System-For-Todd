@@ -25,8 +25,12 @@ const twilio  = require('twilio');
 const client = twilio(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN);
 
 router.post('/', async (req, res) => {
-  const callerName  = req.body.caller_name  || req.body.callerName  || '';
-  const callerPhone = req.body.caller_phone || req.body.callerPhone || '';
+  // Accept several common key spellings so different upstream callers
+  // (GHL workflow vs. n8n vs. direct) all work without renaming fields.
+  const callerName  = req.body.caller_name  || req.body.callerName  ||
+                      req.body.name         || '';
+  const callerPhone = req.body.caller_phone || req.body.callerPhone ||
+                      req.body.phone        || req.body.to          || '';
 
   if (!callerPhone) {
     return res.status(400).json({ ok: false, error: 'caller_phone required' });
