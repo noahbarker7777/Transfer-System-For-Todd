@@ -172,6 +172,10 @@ router.post('/agent-pickup', (req, res) => {
   // Human pickup — brief Todd, then wait for him to accept before bridging.
   const decisionUrl = process.env.SERVER_URL + '/call/agent-decision?' +
                       new URLSearchParams({ conf, clientCallSid }).toString();
+  // CRITICAL: the URL contains '&' between query params. Embedding it raw in
+  // XML attributes / text breaks the TwiML parser and Twilio plays its
+  // "I'm sorry, an application error has occurred" prompt and hangs up.
+  const decisionUrlXml = xmlEscape(decisionUrl);
 
   console.log('[agent-pickup V4] human → briefing then awaiting accept');
   res.type('text/xml').send(
@@ -179,13 +183,13 @@ router.post('/agent-pickup', (req, res) => {
     '<Response>' +
       '<Gather input="speech dtmf" numDigits="1" speechTimeout="auto" ' +
               'timeout="10" finishOnKey="" ' +
-              'action="' + decisionUrl + '" method="POST">' +
+              'action="' + decisionUrlXml + '" method="POST">' +
         humanBriefingTwiml(briefingPayload) +
       '</Gather>' +
       // Belt-and-suspenders: if Gather returns without firing the action URL
       // (e.g. transient Twilio issue), redirect to the same decision endpoint
       // so the no-response path still triggers fallback rather than hanging.
-      '<Redirect method="POST">' + decisionUrl + '</Redirect>' +
+      '<Redirect method="POST">' + decisionUrlXml + '</Redirect>' +
     '</Response>'
   );
 });
