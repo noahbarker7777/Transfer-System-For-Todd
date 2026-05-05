@@ -81,17 +81,17 @@ router.all('/move-client', (req, res) => {
   const clientCallSid   = req.query.clientCallSid || req.body.clientCallSid;
   const agent           = config.AGENT_NAME || 'Todd';
   const serverUrl       = process.env.SERVER_URL;
-  const waitUrl         = serverUrl + '/call/wait-music';
   const confStatusUrl   = serverUrl + '/call/status/conference?clientCallSid=' +
                           encodeURIComponent(clientCallSid || '');
 
   console.log('[move-client V4] callSid=' + clientCallSid + ' conf=' + conf);
 
-  // Cap the conference Dial at 60s so a stuck/stalled flow doesn't leave the
-  // caller on hold music indefinitely. AMD timeout (30s) + ring (15s) +
-  // briefing/Gather (~17s) ≈ 60s worst-case. If we hit the cap, status.js
-  // will see no participant-join and trigger fallback via the agent
-  // completed callback.
+  // No waitUrl / waitMethod — let Twilio play its built-in default hold music.
+  // The previous custom waitUrl pointed at a Twilio-hosted S3 bucket whose
+  // hostname (com.twilio.music.classical.s3.amazonaws.com) fails SSL hostname
+  // verification, causing <Play> to error and Twilio to bail with
+  // "I'm sorry, an application error has occurred. Goodbye." about 4s into
+  // the conference. Default music has no external dependency.
   res.type('text/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Response>' +
@@ -100,9 +100,8 @@ router.all('/move-client', (req, res) => {
       '<Dial timeout="60">' +
         '<Conference ' +
           'startConferenceOnEnter="false" ' +
-          'endConferenceOnExit="true" ' +    // client hangup ends conference
+          'endConferenceOnExit="true" ' +
           'beep="false" ' +
-          'waitUrl="' + waitUrl + '" waitMethod="GET" ' +
           'statusCallback="' + confStatusUrl + '" ' +
           'statusCallbackMethod="POST" ' +
           'statusCallbackEvent="join leave end">' +
